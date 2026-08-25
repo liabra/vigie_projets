@@ -15,6 +15,11 @@ entre PC et téléphone.
 - **Copilote personnalisable** : le bouton **✎ Profil** du panneau Copilote
   règle la phrase qui ouvre chaque prompt (« Tu es le copilote de projets
   de… »). Gardé sur l'appareil, vide = description par défaut.
+- **Choix du modèle** : un menu dans le panneau Copilote bascule entre
+  **Haiku** (rapide, éco — par défaut), **Sonnet** (équilibré) et **Opus**
+  (max). Le choix est gardé sur l'appareil.
+- **Raccourcis par projet** : chaque carte peut afficher **Code** (le repo),
+  **Ouvrir** (le site en ligne) et **Discussion** (la conversation Claude).
 
 ---
 
@@ -32,7 +37,9 @@ entre PC et téléphone.
      tout est perdu à chaque redémarrage.
 4. Toujours dans **Variables**, ajoute :
    - `ANTHROPIC_API_KEY` — ta clé ([console.anthropic.com](https://console.anthropic.com), avec des crédits). **Obligatoire** pour le copilote.
-   - `ANTHROPIC_MODEL` — *optionnel*, par défaut `claude-sonnet-5`.
+   - `ANTHROPIC_MODEL` — *optionnel*. Modèle de repli quand le client n'en
+     demande aucun ; par défaut `claude-haiku-4-5-20251001`. Le menu de
+     l'app prend le dessus, dans la limite de la liste blanche du serveur.
    - `APP_PASSWORD` — *optionnel*, un code d'accès pour verrouiller l'app.
 5. Railway installe, construit (`npm run build`) et démarre (`npm start`) tout
    seul. Puis **Settings → Networking → Generate Domain** pour obtenir l'URL.
@@ -69,15 +76,41 @@ la liste complète.
 
 ---
 
-## Coût de l'API
+## Coût de l'API — et pourquoi ce n'est qu'une estimation
 
 Chaque question au copilote part vers l'API Anthropic et coûte **quelques
 centimes**. La note dépend surtout du nombre de projets (toute la liste est
-envoyée dans le prompt) et de la longueur de la réponse. Pour réduire :
-mets `ANTHROPIC_MODEL` sur un modèle **Haiku**, bien moins cher.
+envoyée dans le prompt), de la longueur de la réponse et du modèle choisi.
+
+L'app affiche sous chaque réponse le coût estimé de la question, plus un
+**total de session** (gardé sur l'appareil, bouton *remettre à zéro*). Il
+compte tous les appels : questions globales **et** boutons « ✦ Prochaine
+étape » des cartes.
+
+> ⚠️ C'est une **estimation** : les tokens réellement consommés (renvoyés par
+> l'API dans `usage`) multipliés par une table de tarifs écrite en dur. Ce
+> n'est pas ta facture Anthropic. Le cache de prompt, les remises et les
+> changements de prix ne sont pas pris en compte.
+
+**La table de tarifs est à maintenir à la main** : constante `PRICES` en haut
+de [`server.js`](server.js), en dollars par million de tokens. Un seul endroit
+à corriger quand les prix bougent. Deux points de vigilance :
+
+- le tarif Sonnet inscrit (2 / 10) est **introductif** — il passe à 3 / 15 le
+  1er septembre 2026 ;
+- `PRICES` sert aussi de **liste blanche** : le serveur n'accepte du client
+  que ces identifiants de modèle et retombe sur le repli sinon. Ajouter un
+  modèle au menu de l'app suppose de l'ajouter d'abord ici.
 
 ## Limites — à garder en tête
 
+- Le lien **Discussion** (`chatUrl`) est un raccourci **personnel** : une URL
+  de conversation Claude ne s'ouvre que depuis le compte qui l'a créée. Elle
+  ne donne rien à quelqu'un d'autre, et le copilote de Vigie n'y a pas accès
+  non plus — c'est un simple marque-page.
+- Le lien **Ouvrir** (`liveUrl`) et le lien **Code** (`repo`, une URL complète
+  ou un raccourci `owner/name` transformé en lien GitHub) n'apparaissent que
+  si le champ est rempli.
 - Le copilote ne voit **que** la liste saisie dans l'app. Pas d'accès à
   GitHub, ni à tes conversations ChatGPT, ni au vrai code. Ce qui n'est pas
   écrit dans une fiche projet n'existe pas pour lui.

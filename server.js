@@ -8,8 +8,30 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 const APP_PASSWORD = process.env.APP_PASSWORD || "";
+
+// ── Modèles & tarifs ──────────────────────────────────────────
+// Tarifs en dollars par million de tokens. Table unique : les prix
+// évoluent, c'est le SEUL endroit à corriger.
+const PRICES = {
+  "claude-haiku-4-5-20251001": { in: 1, out: 5 },
+  // Tarif introductif : passe à 3 / 15 le 1er septembre 2026 — à mettre à jour.
+  "claude-sonnet-5": { in: 2, out: 10 },
+  "claude-opus-4-8": { in: 5, out: 25 },
+};
+// Liste blanche : le client choisit un modèle, mais JAMAIS un nom libre.
+const ALLOWED_MODELS = Object.keys(PRICES);
+const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
+
+// Coût estimé d'un appel, à partir de l'usage renvoyé par l'API.
+// null si le modèle n'est pas dans la table (ex. ANTHROPIC_MODEL exotique).
+function estimateCost(model, usage) {
+  const p = PRICES[model];
+  if (!p || !usage) return null;
+  const inTok = usage.input_tokens || 0;
+  const outTok = usage.output_tokens || 0;
+  return (inTok / 1e6) * p.in + (outTok / 1e6) * p.out;
+}
 
 // ── Stockage : PostgreSQL si DATABASE_URL, sinon mémoire (dev) ─
 const { Pool } = pg;
@@ -84,10 +106,12 @@ app.post("/api/ask", auth, async (req, res) => {
       .status(500)
       .json({ error: "Clé API non configurée sur le serveur (variable ANTHROPIC_API_KEY)." });
   }
-  const { prompt } = req.body || {};
+  const { prompt, model } = req.body || {};
   if (!prompt || typeof prompt !== "string") {
     return res.status(400).json({ error: "Prompt manquant." });
   }
+  // Le modèle demandé n'est retenu que s'il figure dans la liste blanche.
+  const used = ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -97,7 +121,7 @@ app.post("/api/ask", auth, async (req, res) => {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: MODEL,
+        model: used,
         max_tokens: 1000,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -109,7 +133,8 @@ app.post("/api/ask", auth, async (req, res) => {
       .map((b) => b.text)
       .join("\n")
       .trim();
-    res.json({ text });
+    const usage = data.usage || null;
+    res.json({ text, model: used, usage, costUsd: estimateCost(used, usage) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Le serveur n'a pas pu joindre l'IA." });
@@ -117,7 +142,9 @@ app.post("/api/ask", auth, async (req, res) => {
 });
 
 // Indique au front si un code d'accès est requis
-app.get("/api/config", (_req, res) => res.json({ needsKey: !!APP_PASSWORD }));
+app.get("/api/config", (_req, res) =>
+  res.json({ needsKey: !!APP_PASSWORD, models: ALLOWED_MODELS, defaultModel: DEFAULT_MODEL })
+);
 
 // ── Front (build Vite) ────────────────────────────────────────
 const dist = path.join(__dirname, "dist");

@@ -52,6 +52,43 @@ const SEED = [
 const CACHE_KEY = "vigie:projects";
 const APPKEY_KEY = "vigie:key";
 const PROFILE_KEY = "vigie:profil";
+const MODEL_KEY = "vigie:model";
+const COST_KEY = "vigie:coutTotal";
+
+// Modèles proposés. Les IDs doivent rester alignés sur la liste blanche
+// du serveur (PRICES dans server.js) — lui seul décide au final.
+const MODELS = [
+  { id: "claude-haiku-4-5-20251001", label: "Haiku (rapide, éco)" },
+  { id: "claude-sonnet-5", label: "Sonnet (équilibré)" },
+  { id: "claude-opus-4-8", label: "Opus (max)" },
+];
+const DEFAULT_MODEL = MODELS[0].id;
+const getModel = () => {
+  try {
+    const m = localStorage.getItem(MODEL_KEY);
+    return MODELS.some((x) => x.id === m) ? m : DEFAULT_MODEL;
+  } catch { return DEFAULT_MODEL; }
+};
+const saveModel = (m) => { try { localStorage.setItem(MODEL_KEY, m); } catch {} };
+
+const getTotalCost = () => { try { return Number(localStorage.getItem(COST_KEY)) || 0; } catch { return 0; } };
+const saveTotalCost = (n) => { try { localStorage.setItem(COST_KEY, String(n)); } catch {} };
+
+// Affichage d'un montant en dollars, à la française.
+const fmtUsd = (n) => {
+  if (typeof n !== "number" || !isFinite(n)) return "—";
+  if (n > 0 && n < 0.0001) return "< 0,0001 $";
+  return n.toFixed(4).replace(".", ",") + " $";
+};
+
+// Le champ "repo" accepte une URL complète ou un raccourci "owner/name".
+const repoUrl = (repo) => {
+  const r = (repo || "").trim();
+  if (!r) return null;
+  if (/^https?:\/\//i.test(r)) return r;
+  if (/^[\w.-]+\/[\w.-]+$/.test(r)) return "https://github.com/" + r;
+  return null;
+};
 
 // Comment le copilote doit te décrire. Modifiable depuis le panneau Copilote.
 const DEFAULT_PROFILE = "une développeuse indépendante francophone qui construit ses apps en dialoguant avec l'IA";
@@ -82,16 +119,20 @@ async function serverPut(projects) {
   });
   if (r.status === 401) throw { code: 401 };
 }
-async function askClaude(prompt) {
+async function askClaude(prompt, model) {
   const res = await fetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, model }),
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) throw new Error("Accès verrouillé — recharge la page pour entrer le code.");
   if (!res.ok) throw new Error(data.error || "Erreur");
-  return (data.text || "").trim();
+  return {
+    text: (data.text || "").trim(),
+    costUsd: typeof data.costUsd === "number" ? data.costUsd : null,
+    usage: data.usage || null,
+  };
 }
 
 function serialise(projects) {
@@ -128,6 +169,9 @@ export default function App() {
   const [aiError, setAiError] = useState("");
   const [profile, setProfile] = useState(getProfile);
   const [showProfile, setShowProfile] = useState(false);
+  const [model, setModel] = useState(getModel);
+  const [lastCost, setLastCost] = useState(null);
+  const [totalCost, setTotalCost] = useState(getTotalCost);
 
   const saveTimer = useRef(null);
 
@@ -244,6 +288,14 @@ export default function App() {
   // Décrit la personne à qui appartiennent les projets, dans les prompts.
   const who = () => profile.trim() || DEFAULT_PROFILE;
 
+  // Chaque appel au copilote (question globale OU bouton de carte) alimente
+  // le total cumulé, gardé sur l'appareil.
+  const addCost = (c) => {
+    if (typeof c !== "number" || !isFinite(c)) return;
+    setTotalCost((t) => { const n = t + c; saveTotalCost(n); return n; });
+  };
+  const resetCost = () => { setTotalCost(0); saveTotalCost(0); setLastCost(null); };
+
   const suggestNext = async (p) => {
     setCardAI((s) => ({ ...s, [p.id]: { loading: true } }));
     try {
@@ -252,8 +304,9 @@ export default function App() {
         "Voici l'un de ses projets :\n\n" + serialise([p]) +
         "\n\nPropose 2 à 3 prochaines étapes concrètes et actionnables pour avancer, en français, sous forme de courte liste à puces. " +
         "Reste réaliste : si une information manque pour bien conseiller, dis-le en une ligne au lieu d'inventer. Pas de blabla d'introduction.";
-      const text = await askClaude(prompt);
-      setCardAI((s) => ({ ...s, [p.id]: { text } }));
+      const { text, costUsd } = await askClaude(prompt, model);
+      addCost(costUsd);
+      setCardAI((s) => ({ ...s, [p.id]: { text, costUsd } }));
     } catch (e) {
       setCardAI((s) => ({ ...s, [p.id]: { error: e.message || "L’IA n’a pas répondu." } }));
     }
@@ -262,14 +315,16 @@ export default function App() {
   const askPortfolio = async (question) => {
     const question2 = (question || aiQuestion).trim();
     if (!question2 || !projects) return;
-    setAiLoading(true); setAiError(""); setAiAnswer("");
+    setAiLoading(true); setAiError(""); setAiAnswer(""); setLastCost(null);
     try {
       const prompt =
         "Tu es le copilote de projets de " + who() + ". " +
         "Tu raisonnes UNIQUEMENT à partir de la liste de projets ci-dessous (tu n'as pas d'autre accès : ni à GitHub, ni à ChatGPT, ni au vrai code). " +
         "Si la liste ne suffit pas pour répondre, dis-le franchement. Réponds en français, de façon concise et concrète, sans flatterie.\n\n" +
         "PROJETS :\n" + serialise(projects) + "\n\nQUESTION : " + question2;
-      const text = await askClaude(prompt);
+      const { text, costUsd } = await askClaude(prompt, model);
+      addCost(costUsd);
+      setLastCost(costUsd);
       setAiAnswer(text);
     } catch (e) {
       setAiError(e.message || "L’IA n’a pas répondu.");
@@ -315,9 +370,18 @@ export default function App() {
             <span style={S.spark}>✦</span>
             <h2 style={S.h2}>Copilote</h2>
             <span style={{ fontFamily: "Inter", fontSize: 12.5, color: "rgba(255,255,255,.6)" }}>raisonne sur les projets ci-dessous</span>
+            <select
+              className="at-focus"
+              style={{ ...S.modelSelect, marginLeft: "auto" }}
+              title="Modèle utilisé pour répondre"
+              value={model}
+              onChange={(e) => { setModel(e.target.value); saveModel(e.target.value); }}
+            >
+              {MODELS.map((m) => (<option key={m.id} value={m.id} style={{ color: theme.ink }}>{m.label}</option>))}
+            </select>
             <button
               className="at-btn at-focus"
-              style={{ ...S.chip, marginLeft: "auto" }}
+              style={S.chip}
               title="Comment le copilote doit te décrire"
               onClick={() => setShowProfile((v) => !v)}
             >
@@ -358,8 +422,16 @@ export default function App() {
               {aiLoading && <span style={{ opacity: 0.7 }}>Le copilote réfléchit…</span>}
               {aiError && <span style={{ color: "#FFD7C7" }}>{aiError}</span>}
               {aiAnswer && <div style={{ whiteSpace: "pre-wrap" }}>{aiAnswer}</div>}
+              {aiAnswer && typeof lastCost === "number" && (
+                <div style={S.costLine}>≈ {fmtUsd(lastCost)} pour cette question</div>
+              )}
             </div>
           )}
+          <div style={S.costBar}>
+            <span>Total de la session : <strong>≈ {fmtUsd(totalCost)}</strong></span>
+            <button className="at-btn at-focus" style={S.costReset} onClick={resetCost}>remettre à zéro</button>
+            <span style={S.costNote}>estimation (tokens × table de tarifs), pas la facture réelle Anthropic</span>
+          </div>
         </section>
 
         <div style={S.toolbar}>
@@ -376,7 +448,7 @@ export default function App() {
               <FilterChip key={s} active={sourceFilter === s} color={SOURCES[s].color} onClick={() => setSourceFilter(s)}>{SOURCES[s].label}</FilterChip>
             ))}
           </div>
-          <button className="at-btn at-focus" style={S.primaryBtn} onClick={() => setEditing({ id: null, name: "", source: "chatgpt", status: "idée", type: "", stack: [], repo: "", nextStep: "", notes: "" })}>
+          <button className="at-btn at-focus" style={S.primaryBtn} onClick={() => setEditing({ id: null, name: "", source: "chatgpt", status: "idée", type: "", stack: [], repo: "", liveUrl: "", chatUrl: "", nextStep: "", notes: "" })}>
             + Nouveau projet
           </button>
         </div>
@@ -408,11 +480,31 @@ export default function App() {
                       </div>
                     )}
                     {p.repo && <div style={S.repo}>⎇ {p.repo}</div>}
+                    {(repoUrl(p.repo) || p.liveUrl || p.chatUrl) && (
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+                        {repoUrl(p.repo) && (
+                          <a className="at-btn at-focus" style={S.linkBtn} href={repoUrl(p.repo)} target="_blank" rel="noopener noreferrer">Code</a>
+                        )}
+                        {p.liveUrl && (
+                          <a className="at-btn at-focus" style={S.linkBtn} href={p.liveUrl} target="_blank" rel="noopener noreferrer">Ouvrir</a>
+                        )}
+                        {p.chatUrl && (
+                          <a className="at-btn at-focus" style={S.linkBtn} href={p.chatUrl} target="_blank" rel="noopener noreferrer">Discussion</a>
+                        )}
+                      </div>
+                    )}
                     {p.nextStep && (
                       <div style={S.nextStep}><span style={{ color: theme.amber, fontWeight: 600 }}>Prochaine étape · </span>{p.nextStep}</div>
                     )}
                     {open && p.notes && <p style={S.notes}>{p.notes}</p>}
-                    {ai?.text && <div style={S.aiCard}>{ai.text}</div>}
+                    {ai?.text && (
+                      <div style={S.aiCard}>
+                        {ai.text}
+                        {typeof ai.costUsd === "number" && (
+                          <div style={{ ...S.costLine, color: theme.mute }}>≈ {fmtUsd(ai.costUsd)} pour cette suggestion</div>
+                        )}
+                      </div>
+                    )}
                     {ai?.error && <div style={{ ...S.aiCard, color: "#B23B15" }}>{ai.error}</div>}
                     <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                       <button className="at-btn at-focus" style={S.softBtn} onClick={() => suggestNext(p)} disabled={ai?.loading}>{ai?.loading ? "…" : "✦ Prochaine étape"}</button>
@@ -467,7 +559,15 @@ function FilterChip({ active, color = theme.ink, onClick, children }) {
 }
 
 function Editor({ initial, onCancel, onSave, onDelete }) {
-  const [f, setF] = useState({ ...initial, stackText: (initial.stack || []).join(", ") });
+  const [f, setF] = useState({
+    ...initial,
+    repo: initial.repo || "",
+    liveUrl: initial.liveUrl || "",
+    chatUrl: initial.chatUrl || "",
+    nextStep: initial.nextStep || "",
+    notes: initial.notes || "",
+    stackText: (initial.stack || []).join(", "),
+  });
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const save = () => {
     if (!f.name.trim()) return;
@@ -486,6 +586,8 @@ function Editor({ initial, onCancel, onSave, onDelete }) {
         <Field label="Type (ex. Jeu, App enfants, Client…)"><input className="at-focus" style={S.field} value={f.type} onChange={(e) => set("type", e.target.value)} /></Field>
         <Field label="Stack / technos (séparées par des virgules)"><input className="at-focus" style={S.field} value={f.stackText} onChange={(e) => set("stackText", e.target.value)} placeholder="React, Vite, FastAPI…" /></Field>
         <Field label="Repo (optionnel)"><input className="at-focus" style={S.field} value={f.repo} onChange={(e) => set("repo", e.target.value)} placeholder="liabra/mon-projet" /></Field>
+        <Field label="Lien du projet en ligne (optionnel)"><input className="at-focus" style={S.field} value={f.liveUrl} onChange={(e) => set("liveUrl", e.target.value)} placeholder="https://mon-projet.up.railway.app" /></Field>
+        <Field label="Conversation Claude liée (optionnel)"><input className="at-focus" style={S.field} value={f.chatUrl} onChange={(e) => set("chatUrl", e.target.value)} placeholder="https://claude.ai/chat/…" /></Field>
         <Field label="Prochaine étape"><textarea className="at-focus" style={{ ...S.field, minHeight: 56, resize: "vertical" }} value={f.nextStep} onChange={(e) => set("nextStep", e.target.value)} /></Field>
         <Field label="Notes"><textarea className="at-focus" style={{ ...S.field, minHeight: 56, resize: "vertical" }} value={f.notes} onChange={(e) => set("notes", e.target.value)} /></Field>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: 18, gap: 10 }}>
@@ -523,6 +625,12 @@ const S = {
   h2: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, fontWeight: 600, margin: 0, color: "#fff" },
   chip: { fontFamily: "Inter", fontSize: 12.5, padding: "6px 11px", borderRadius: 999, border: "1px solid rgba(255,255,255,.35)", background: "rgba(255,255,255,.10)", color: "#fff", cursor: "pointer" },
   aiInput: { flex: 1, fontFamily: "Inter", fontSize: 14, padding: "11px 14px", borderRadius: 11, border: "none", background: "rgba(255,255,255,.16)", color: "#fff" },
+  modelSelect: { fontFamily: "Inter", fontSize: 12.5, padding: "6px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,.35)", background: "rgba(255,255,255,.10)", color: "#fff", cursor: "pointer" },
+  costLine: { fontFamily: "Inter", fontSize: 11.5, opacity: 0.75, marginTop: 8 },
+  costBar: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 12, fontFamily: "Inter", fontSize: 12, color: "rgba(255,255,255,.8)" },
+  costReset: { fontFamily: "Inter", fontSize: 11.5, padding: "3px 9px", borderRadius: 999, border: "1px solid rgba(255,255,255,.3)", background: "transparent", color: "rgba(255,255,255,.85)", cursor: "pointer" },
+  costNote: { fontSize: 11.5, color: "rgba(255,255,255,.55)" },
+  linkBtn: { fontFamily: "Inter", fontSize: 12.5, fontWeight: 500, padding: "5px 11px", borderRadius: 999, border: "1px solid " + theme.line, background: theme.paper, color: theme.violet, textDecoration: "none", cursor: "pointer" },
   profileBox: { background: "rgba(255,255,255,.10)", borderRadius: 12, padding: "12px 14px", marginBottom: 12 },
   profileLabel: { display: "block", fontFamily: "Inter", fontSize: 12.5, fontWeight: 600, color: "rgba(255,255,255,.85)", marginBottom: 6 },
   profileHint: { fontFamily: "Inter", fontSize: 11.5, lineHeight: 1.45, color: "rgba(255,255,255,.6)", marginTop: 7 },
