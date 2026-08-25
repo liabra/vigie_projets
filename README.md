@@ -12,6 +12,9 @@ entre PC et téléphone.
   Anthropic. Il passe par le serveur, qui seul détient la clé.
 - **Code d'accès optionnel** : si tu définis `APP_PASSWORD`, l'app le demande
   à l'ouverture. Sinon elle est ouverte.
+- **Copilote personnalisable** : le bouton **✎ Profil** du panneau Copilote
+  règle la phrase qui ouvre chaque prompt (« Tu es le copilote de projets
+  de… »). Gardé sur l'appareil, vide = description par défaut.
 
 ---
 

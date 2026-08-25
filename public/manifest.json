@@ -1,6 +1,6 @@
 {
-  "name": "Boussole",
-  "short_name": "Boussole",
+  "name": "Vigie — suivi de projets",
+  "short_name": "Vigie",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -51,6 +51,12 @@ const SEED = [
 
 const CACHE_KEY = "vigie:projects";
 const APPKEY_KEY = "vigie:key";
+const PROFILE_KEY = "vigie:profil";
+
+// Comment le copilote doit te décrire. Modifiable depuis le panneau Copilote.
+const DEFAULT_PROFILE = "une développeuse indépendante francophone qui construit ses apps en dialoguant avec l'IA";
+const getProfile = () => { try { return localStorage.getItem(PROFILE_KEY) ?? DEFAULT_PROFILE; } catch { return DEFAULT_PROFILE; } };
+const saveProfile = (v) => { try { localStorage.setItem(PROFILE_KEY, v); } catch {} };
 
 const getKey = () => { try { return localStorage.getItem(APPKEY_KEY) || ""; } catch { return ""; } };
 const setKey = (k) => { try { localStorage.setItem(APPKEY_KEY, k); } catch {} };
@@ -120,6 +126,8 @@ export default function App() {
   const [aiAnswer, setAiAnswer] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState("");
+  const [profile, setProfile] = useState(getProfile);
+  const [showProfile, setShowProfile] = useState(false);
 
   const saveTimer = useRef(null);
 
@@ -233,11 +241,14 @@ export default function App() {
     setProjects(next); scheduleSave(next);
   };
 
+  // Décrit la personne à qui appartiennent les projets, dans les prompts.
+  const who = () => profile.trim() || DEFAULT_PROFILE;
+
   const suggestNext = async (p) => {
     setCardAI((s) => ({ ...s, [p.id]: { loading: true } }));
     try {
       const prompt =
-        "Tu es le copilote de projets d'une développeuse indépendante francophone qui construit ses apps en dialoguant avec l'IA. " +
+        "Tu es le copilote de projets de " + who() + ". " +
         "Voici l'un de ses projets :\n\n" + serialise([p]) +
         "\n\nPropose 2 à 3 prochaines étapes concrètes et actionnables pour avancer, en français, sous forme de courte liste à puces. " +
         "Reste réaliste : si une information manque pour bien conseiller, dis-le en une ligne au lieu d'inventer. Pas de blabla d'introduction.";
@@ -254,7 +265,7 @@ export default function App() {
     setAiLoading(true); setAiError(""); setAiAnswer("");
     try {
       const prompt =
-        "Tu es le copilote de projets d'une développeuse indépendante francophone. " +
+        "Tu es le copilote de projets de " + who() + ". " +
         "Tu raisonnes UNIQUEMENT à partir de la liste de projets ci-dessous (tu n'as pas d'autre accès : ni à GitHub, ni à ChatGPT, ni au vrai code). " +
         "Si la liste ne suffit pas pour répondre, dis-le franchement. Réponds en français, de façon concise et concrète, sans flatterie.\n\n" +
         "PROJETS :\n" + serialise(projects) + "\n\nQUESTION : " + question2;
@@ -304,7 +315,33 @@ export default function App() {
             <span style={S.spark}>✦</span>
             <h2 style={S.h2}>Copilote</h2>
             <span style={{ fontFamily: "Inter", fontSize: 12.5, color: "rgba(255,255,255,.6)" }}>raisonne sur les projets ci-dessous</span>
+            <button
+              className="at-btn at-focus"
+              style={{ ...S.chip, marginLeft: "auto" }}
+              title="Comment le copilote doit te décrire"
+              onClick={() => setShowProfile((v) => !v)}
+            >
+              {showProfile ? "Fermer" : "✎ Profil"}
+            </button>
           </div>
+          {showProfile && (
+            <div style={S.profileBox}>
+              <label style={S.profileLabel} htmlFor="profil">Le copilote s’adresse à…</label>
+              <input
+                id="profil"
+                className="at-focus"
+                style={{ ...S.aiInput, width: "100%" }}
+                placeholder={DEFAULT_PROFILE}
+                value={profile}
+                onChange={(e) => { setProfile(e.target.value); saveProfile(e.target.value); }}
+                onKeyDown={(e) => e.key === "Enter" && setShowProfile(false)}
+              />
+              <div style={S.profileHint}>
+                Cette phrase ouvre chaque question envoyée au copilote : « Tu es le copilote de projets de {who()}. »
+                Vide = description par défaut. Gardé sur cet appareil.
+              </div>
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
             {quickPrompts.map((qp) => (
               <button key={qp} className="at-btn at-focus" style={S.chip} onClick={() => { setAiQuestion(qp); askPortfolio(qp); }}>{qp}</button>
@@ -486,6 +523,9 @@ const S = {
   h2: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 19, fontWeight: 600, margin: 0, color: "#fff" },
   chip: { fontFamily: "Inter", fontSize: 12.5, padding: "6px 11px", borderRadius: 999, border: "1px solid rgba(255,255,255,.35)", background: "rgba(255,255,255,.10)", color: "#fff", cursor: "pointer" },
   aiInput: { flex: 1, fontFamily: "Inter", fontSize: 14, padding: "11px 14px", borderRadius: 11, border: "none", background: "rgba(255,255,255,.16)", color: "#fff" },
+  profileBox: { background: "rgba(255,255,255,.10)", borderRadius: 12, padding: "12px 14px", marginBottom: 12 },
+  profileLabel: { display: "block", fontFamily: "Inter", fontSize: 12.5, fontWeight: 600, color: "rgba(255,255,255,.85)", marginBottom: 6 },
+  profileHint: { fontFamily: "Inter", fontSize: 11.5, lineHeight: 1.45, color: "rgba(255,255,255,.6)", marginTop: 7 },
   aiAnswer: { marginTop: 14, background: "rgba(255,255,255,.12)", borderRadius: 12, padding: "13px 15px", fontSize: 14, lineHeight: 1.55, fontFamily: "Inter" },
 
   toolbar: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 20 },
