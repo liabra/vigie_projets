@@ -18,13 +18,32 @@ const CATEGORIES = {
 };
 const CATEGORY_ORDER = ["perso", "admin", "dev"];
 
+// Le statut colore la carte entière (liseré + pastille). « Fait »
+// reprend le gris + ✓ de l'agenda, pour que les deux se ressemblent.
 const STATUSES = {
-  a_faire: { label: "À faire", color: theme.slate, bg: "#EAECF3" },
-  en_cours: { label: "En cours", color: theme.violet, bg: theme.violetSoft },
-  fait: { label: "Fait", color: theme.green, bg: theme.greenSoft },
+  a_faire: { label: "À faire", color: theme.orange, bg: theme.orangeSoft },
+  en_cours: { label: "En cours", color: theme.statusViolet, bg: theme.statusVioletSoft },
+  fait: { label: "✓ Fait", color: theme.doneGrey, bg: theme.doneGreySoft },
 };
 const STATUS_ORDER = ["a_faire", "en_cours", "fait"];
 const NEXT_STATUS = { a_faire: "en_cours", en_cours: "fait", fait: "a_faire" };
+
+// L'urgence est un canal SÉPARÉ du statut : jamais de liseré, seulement
+// un badge. Elle reste interne à Vigie et ne part pas vers l'agenda.
+const URGENCIES = {
+  normale: { label: "Normale", badge: null },
+  importante: {
+    label: "Importante",
+    badge: "Important",
+    style: { color: theme.ink, background: theme.panel, border: "1.5px solid " + theme.ink },
+  },
+  urgente: {
+    label: "Urgente",
+    badge: "● Urgent",
+    style: { color: "#FFFFFF", background: theme.red, border: "1.5px solid " + theme.red },
+  },
+};
+const URGENCY_ORDER = ["normale", "importante", "urgente"];
 
 const cache = {
   load() { try { const r = localStorage.getItem(CACHE_KEY); return r ? JSON.parse(r) : null; } catch { return null; } },
@@ -68,6 +87,7 @@ export default function Tasks({ onLocked }) {
   const [msg, setMsg] = useState("");
   const [statusFilter, setStatusFilter] = useState("tous");
   const [catFilter, setCatFilter] = useState("toutes");
+  const [urgFilter, setUrgFilter] = useState("toutes");
   const [editing, setEditing] = useState(null);
   const [busy, setBusy] = useState(false);
   const [google, setGoogle] = useState(null);
@@ -77,6 +97,7 @@ export default function Tasks({ onLocked }) {
   const [category, setCategory] = useState("perso");
   const [due, setDue] = useState("");
   const [allDay, setAllDay] = useState(true);
+  const [urgency, setUrgency] = useState("normale");
 
   const fail = (e) => {
     if (e && e.code === 401) { onLocked && onLocked(); return true; }
@@ -131,10 +152,10 @@ export default function Tasks({ onLocked }) {
     try {
       const d = await api("/api/tasks", {
         method: "POST",
-        body: JSON.stringify({ title: t, category, dueDate: due || null, dueAllDay: allDay }),
+        body: JSON.stringify({ title: t, category, urgency, dueDate: due || null, dueAllDay: allDay }),
       });
       apply([...(tasks || []), d.task]);
-      setTitle(""); setDue("");
+      setTitle(""); setDue(""); setUrgency("normale");
       setMsg(d.syncWarning || "");
     } catch (e) {
       if (!fail(e)) setMsg("La tâche n'a pas pu être créée (serveur injoignable ?).");
@@ -198,8 +219,9 @@ export default function Tasks({ onLocked }) {
     () =>
       list
         .filter((t) => statusFilter === "tous" || t.status === statusFilter)
-        .filter((t) => catFilter === "toutes" || t.category === catFilter),
-    [list, statusFilter, catFilter]
+        .filter((t) => catFilter === "toutes" || t.category === catFilter)
+        .filter((t) => urgFilter === "toutes" || (t.urgency || "normale") === urgFilter),
+    [list, statusFilter, catFilter, urgFilter]
   );
 
   return (
@@ -236,6 +258,9 @@ export default function Tasks({ onLocked }) {
         <select className="at-focus" style={S.select} value={category} onChange={(e) => setCategory(e.target.value)}>
           {CATEGORY_ORDER.map((c) => (<option key={c} value={c}>{CATEGORIES[c].label}</option>))}
         </select>
+        <select className="at-focus" style={S.select} value={urgency} onChange={(e) => setUrgency(e.target.value)} title="Niveau d’urgence">
+          {URGENCY_ORDER.map((u) => (<option key={u} value={u}>{URGENCIES[u].label}</option>))}
+        </select>
         <input
           className="at-focus"
           style={S.date}
@@ -267,6 +292,18 @@ export default function Tasks({ onLocked }) {
         {CATEGORY_ORDER.map((c) => (
           <Chip key={c} active={catFilter === c} color={CATEGORIES[c].color} onClick={() => setCatFilter(c)}>{CATEGORIES[c].label}</Chip>
         ))}
+        <span style={{ width: 10 }} />
+        <Chip active={urgFilter === "toutes"} onClick={() => setUrgFilter("toutes")}>Urgences</Chip>
+        {URGENCY_ORDER.map((u) => (
+          <Chip
+            key={u}
+            active={urgFilter === u}
+            color={u === "urgente" ? theme.red : u === "importante" ? theme.ink : theme.slate}
+            onClick={() => setUrgFilter(u)}
+          >
+            {URGENCIES[u].label}
+          </Chip>
+        ))}
       </div>
 
       {msg && <div style={S.msg}>{msg}</div>}
@@ -276,31 +313,47 @@ export default function Tasks({ onLocked }) {
       ) : filtered.length === 0 ? (
         <div style={S.empty}>Rien ici. Ajoute une tâche ci-dessus, ou change les filtres.</div>
       ) : (
-        <div style={S.list}>
+        <div style={S.grid}>
           {filtered.map((t) => {
             const st = STATUSES[t.status];
             const cat = CATEGORIES[t.category] || CATEGORIES.perso;
+            const urg = URGENCIES[t.urgency] || URGENCIES.normale;
+            const done = t.status === "fait";
             return (
-              <div key={t.id} style={S.row}>
-                <button
-                  className="at-btn at-focus"
-                  style={{ ...S.statusBtn, color: st.color, background: st.bg }}
-                  title="Cliquer pour changer le statut"
-                  onClick={() => cycle(t)}
-                >
-                  ● {st.label}
-                </button>
-                <span style={{ ...S.title, textDecoration: t.status === "fait" ? "line-through" : "none", opacity: t.status === "fait" ? 0.6 : 1 }}>
-                  {t.title}
-                </span>
-                <span style={{ ...S.catTag, color: cat.color, background: cat.bg }}>{cat.label}</span>
-                {t.dueDate && (
-                  <span style={{ ...S.due, color: isLate(t) ? "#B23B15" : theme.mute }}>
-                    {humanDate(t)}{t.calendarEventId ? " · agenda" : ""}
-                  </span>
-                )}
-                <button className="at-btn at-focus" style={S.rowBtn} onClick={() => setEditing(t)}>Modifier</button>
-              </div>
+              <article key={t.id} className="at-card" style={{ ...S.card, borderColor: done ? theme.line : st.color + "44" }}>
+                {/* Liseré latéral : la couleur de statut, comme sur les cartes projet. */}
+                <div style={{ ...S.spine, background: st.color, opacity: done ? 0.45 : 1 }} />
+                <div style={S.cardBody}>
+                  <div style={S.cardTop}>
+                    <h3 style={{ ...S.cardTitle, textDecoration: done ? "line-through" : "none", color: done ? theme.mute : theme.ink }}>
+                      {t.title}
+                    </h3>
+                    {urg.badge && (
+                      <span style={{ ...S.urgBadge, ...urg.style, opacity: done ? 0.45 : 1 }}>{urg.badge}</span>
+                    )}
+                  </div>
+                  <div style={S.cardMeta}>
+                    <button
+                      className="at-btn at-focus"
+                      style={{ ...S.statusBtn, color: st.color, background: st.bg }}
+                      title="Cliquer pour changer le statut"
+                      onClick={() => cycle(t)}
+                    >
+                      {done ? "" : "● "}{st.label}
+                    </button>
+                    <span style={{ ...S.catTag, color: cat.color, background: cat.bg }}>{cat.label}</span>
+                  </div>
+                  {t.dueDate && (
+                    <div style={{ ...S.due, color: isLate(t) ? theme.red : theme.mute }}>
+                      {isLate(t) ? "⚠ " : ""}{humanDate(t)}
+                      {t.calendarEventId ? " · agenda" : ""}
+                    </div>
+                  )}
+                  <div style={S.cardActions}>
+                    <button className="at-btn at-focus" style={S.rowBtn} onClick={() => setEditing(t)}>Modifier</button>
+                  </div>
+                </div>
+              </article>
             );
           })}
         </div>
@@ -338,6 +391,7 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
   const [title, setTitle] = useState(task.title);
   const [category, setCategory] = useState(task.category);
   const [status, setStatus] = useState(task.status);
+  const [urgency, setUrgency] = useState(task.urgency || "normale");
   const [allDay, setAllDay] = useState(task.dueAllDay !== false);
   const [due, setDue] = useState(
     !task.dueDate ? "" : task.dueAllDay !== false ? dayOf(task.dueDate) : localInput(task.dueDate)
@@ -349,6 +403,7 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
       title: title.trim(),
       category,
       status,
+      urgency,
       dueAllDay: allDay,
       dueDate: due ? (allDay ? due : new Date(due).toISOString()) : null,
     });
@@ -373,6 +428,12 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
               {STATUS_ORDER.map((s) => (<option key={s} value={s}>{STATUSES[s].label}</option>))}
             </select>
           </div>
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <label style={S.label}>Urgence (interne à Vigie — n’apparaît pas dans l’agenda)</label>
+          <select className="at-focus" style={S.field} value={urgency} onChange={(e) => setUrgency(e.target.value)}>
+            {URGENCY_ORDER.map((u) => (<option key={u} value={u}>{URGENCIES[u].label}</option>))}
+          </select>
         </div>
         <div style={{ marginTop: 12 }}>
           <label style={S.label}>Échéance (vide = pas d’événement d’agenda)</label>
@@ -403,7 +464,7 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
 }
 
 const S = {
-  wrap: { marginTop: 34 },
+  wrap: { marginTop: 0 },
   head: { display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 14 },
   h2: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, fontWeight: 700, margin: 0, color: theme.ink, letterSpacing: "-0.01em" },
   counts: { fontFamily: "Inter", fontSize: 13, color: theme.mute },
@@ -422,12 +483,18 @@ const S = {
   filters: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 14 },
   msg: { fontFamily: "Inter", fontSize: 12.5, color: theme.amber, marginBottom: 10 },
 
-  list: { display: "flex", flexDirection: "column", gap: 8 },
-  row: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", background: theme.panel, border: "1px solid " + theme.line, borderRadius: 12, padding: "10px 13px" },
+  grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 },
+  card: { position: "relative", background: theme.panel, borderRadius: 14, border: "1px solid " + theme.line, overflow: "hidden", display: "flex" },
+  spine: { width: 5, flexShrink: 0 },
+  cardBody: { padding: "13px 15px", flex: 1, minWidth: 0 },
+  cardTop: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 },
+  cardTitle: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 15.5, fontWeight: 600, margin: 0, lineHeight: 1.3 },
+  cardMeta: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginTop: 10 },
+  cardActions: { display: "flex", gap: 8, marginTop: 12 },
+  urgBadge: { fontFamily: "Inter", fontSize: 10.5, fontWeight: 700, letterSpacing: ".02em", padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0 },
   statusBtn: { fontFamily: "Inter", fontSize: 12.5, fontWeight: 600, padding: "4px 10px", borderRadius: 999, border: "none", cursor: "pointer", whiteSpace: "nowrap" },
-  title: { fontFamily: "Inter", fontSize: 14.5, color: theme.ink, flex: "1 1 160px", minWidth: 0 },
   catTag: { fontFamily: "'JetBrains Mono', monospace", fontSize: 11, padding: "2px 7px", borderRadius: 6 },
-  due: { fontFamily: "Inter", fontSize: 12.5, whiteSpace: "nowrap" },
+  due: { fontFamily: "Inter", fontSize: 12.5, marginTop: 10 },
   rowBtn: { fontFamily: "Inter", fontSize: 12.5, padding: "5px 11px", borderRadius: 9, border: "1px solid " + theme.line, background: theme.paper, color: theme.slate, cursor: "pointer" },
 
   empty: { fontFamily: "Inter", fontSize: 14, color: theme.mute, textAlign: "center", padding: "30px 20px", background: theme.panel, borderRadius: 12, border: "1px dashed " + theme.line },

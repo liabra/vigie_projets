@@ -59,10 +59,13 @@ async function ensureTable() {
     status text NOT NULL DEFAULT 'a_faire',
     due_date timestamptz,
     due_all_day boolean NOT NULL DEFAULT true,
+    urgency text NOT NULL DEFAULT 'normale',
     calendar_event_id text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
   )`);
+  // Ajouté après coup : les tâches déjà en base passent à 'normale'.
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS urgency text NOT NULL DEFAULT 'normale'");
   // user_id : un seul 'owner' aujourd'hui, la clé est là pour plus tard.
   await pool.query(`CREATE TABLE IF NOT EXISTS google_auth (
     user_id text PRIMARY KEY,
@@ -101,6 +104,9 @@ let memSettings = new Map();
 
 const CATEGORIES = ["perso", "admin", "dev"];
 const TASK_STATUSES = ["a_faire", "en_cours", "fait"];
+// Urgence : purement interne à Vigie. Elle ne part JAMAIS vers l'agenda
+// Google — voir buildEventBody dans google.js, qui ne lit pas ce champ.
+const URGENCIES = ["normale", "importante", "urgente"];
 
 async function getSetting(key) {
   if (!pool) return memSettings.get(key) ?? null;
@@ -151,9 +157,9 @@ async function getTask(id) {
 async function insertTask(t) {
   if (!pool) { memTasks.push(t); return t; }
   await pool.query(
-    `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, calendar_event_id, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.calendar_event_id, t.created_at, t.updated_at]
+    `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, urgency, calendar_event_id, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.created_at, t.updated_at]
   );
   return t;
 }
@@ -161,8 +167,8 @@ async function writeTask(t) {
   if (!pool) { memTasks = memTasks.map((x) => (x.id === t.id ? t : x)); return t; }
   await pool.query(
     `UPDATE tasks SET title=$2, category=$3, status=$4, due_date=$5, due_all_day=$6,
-       calendar_event_id=$7, updated_at=$8 WHERE id=$1`,
-    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.calendar_event_id, t.updated_at]
+       urgency=$7, calendar_event_id=$8, updated_at=$9 WHERE id=$1`,
+    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.updated_at]
   );
   return t;
 }
@@ -179,6 +185,7 @@ const taskToJson = (t) => ({
   status: t.status,
   dueDate: t.due_date ? new Date(t.due_date).toISOString() : null,
   dueAllDay: t.due_all_day,
+  urgency: t.urgency || "normale",
   calendarEventId: t.calendar_event_id || null,
   createdAt: t.created_at ? new Date(t.created_at).toISOString() : null,
   updatedAt: t.updated_at ? new Date(t.updated_at).toISOString() : null,
@@ -308,6 +315,7 @@ app.post("/api/tasks", auth, async (req, res) => {
     title: title.slice(0, 300),
     category: CATEGORIES.includes(b.category) ? b.category : "perso",
     status: TASK_STATUSES.includes(b.status) ? b.status : "a_faire",
+    urgency: URGENCIES.includes(b.urgency) ? b.urgency : "normale",
     due_date: parseDue(b.dueDate, allDay),
     due_all_day: allDay,
     calendar_event_id: null,
@@ -343,6 +351,7 @@ app.patch("/api/tasks/:id", auth, async (req, res) => {
       if (!TASK_STATUSES.includes(b.status)) return res.status(400).json({ error: "Statut inconnu." });
       task.status = b.status;
     }
+    if (b.urgency !== undefined) task.urgency = URGENCIES.includes(b.urgency) ? b.urgency : "normale";
     if (b.dueAllDay !== undefined) task.due_all_day = !!b.dueAllDay;
     if (b.dueDate !== undefined) task.due_date = parseDue(b.dueDate, task.due_all_day);
     else if (b.dueAllDay !== undefined && task.due_date) task.due_date = parseDue(task.due_date, task.due_all_day);

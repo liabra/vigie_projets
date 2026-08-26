@@ -20,9 +20,16 @@ synchronisées entre PC et téléphone.
   (max). Le choix est gardé sur l'appareil.
 - **Raccourcis par projet** : chaque carte peut afficher **Code** (le repo),
   **Ouvrir** (le site en ligne) et **Discussion** (la conversation Claude).
-- **Tâches** : perso / admin / dev, filtrables par statut et par catégorie,
-  avec une échéance facultative. Celles qui ont une échéance sont poussées
-  dans un agenda Google dédié (voir plus bas).
+- **Deux onglets** : *Projets dev* (les cartes projet et le copilote) et
+  *Tâches agenda*. L'onglet ouvert est retenu d'une visite à l'autre.
+- **Tâches** : perso / admin / dev, filtrables par statut, catégorie et
+  urgence, avec une échéance facultative. Celles qui ont une échéance sont
+  poussées dans un agenda Google dédié (voir plus bas).
+- **Deux lectures visuelles distinctes** sur une carte de tâche : le
+  **statut** colore la carte (orange à faire, violet en cours, grisé + ✓
+  fait, comme dans l'agenda), l'**urgence** n'est qu'un badge (rien,
+  *Important*, ou une pastille rouge *Urgent*). L'urgence reste **interne à
+  Vigie** : elle ne part jamais vers Google.
 
 ---
 

@@ -48,6 +48,7 @@ const SEED = [
 const CACHE_KEY = "vigie:projects";
 const PROFILE_KEY = "vigie:profil";
 const MODEL_KEY = "vigie:model";
+const TAB_KEY = "vigie:onglet";
 const COST_KEY = "vigie:coutTotal";
 
 // Modèles proposés. Les IDs doivent rester alignés sur la liste blanche
@@ -146,6 +147,15 @@ function serialise(projects) {
 export default function App() {
   const [projects, setProjects] = useState(null);
   const [locked, setLocked] = useState(false);
+  // Onglet courant, retenu d'une visite à l'autre. Le retour du
+  // consentement Google (/?google=ok) ouvre d'office l'onglet Tâches :
+  // c'est Tasks qui affiche la confirmation.
+  const [tab, setTab] = useState(() => {
+    try {
+      if (new URLSearchParams(window.location.search).has("google")) return "taches";
+      return localStorage.getItem(TAB_KEY) === "taches" ? "taches" : "projets";
+    } catch { return "projets"; }
+  });
   const [syncMsg, setSyncMsg] = useState("");
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("tous");
@@ -285,6 +295,8 @@ export default function App() {
     if (typeof c !== "number" || !isFinite(c)) return;
     setTotalCost((t) => { const n = t + c; saveTotalCost(n); return n; });
   };
+  const goTab = (t) => { setTab(t); try { localStorage.setItem(TAB_KEY, t); } catch {} };
+
   const resetCost = () => { setTotalCost(0); saveTotalCost(0); setLastCost(null); };
 
   const suggestNext = async (p) => {
@@ -347,14 +359,40 @@ export default function App() {
             <h1 style={S.h1}>Vigie</h1>
             <span style={S.subtitle}>le tableau de bord de tous tes projets</span>
           </div>
-          <div style={S.statsRow}>
-            <Stat n={stats.total} label="projets" color={theme.ink} />
-            <Stat n={stats["en cours"]} label="en cours" color={theme.violet} />
-            <Stat n={stats["en pause"]} label="en pause" color={theme.amber} />
-            <Stat n={stats.publiés} label="finis / publiés" color={theme.green} />
-          </div>
           {syncMsg && <div style={S.syncMsg}>{syncMsg}</div>}
         </header>
+
+        <div style={S.tabs} role="tablist">
+          <button
+            className="at-btn at-focus"
+            role="tab"
+            aria-selected={tab === "projets"}
+            style={{ ...S.tab, ...(tab === "projets" ? S.tabOn : null) }}
+            onClick={() => goTab("projets")}
+          >
+            Projets dev
+          </button>
+          <button
+            className="at-btn at-focus"
+            role="tab"
+            aria-selected={tab === "taches"}
+            style={{ ...S.tab, ...(tab === "taches" ? S.tabOn : null) }}
+            onClick={() => goTab("taches")}
+          >
+            Tâches agenda
+          </button>
+        </div>
+
+        {tab === "taches" ? (
+          <Tasks onLocked={() => setLocked(true)} />
+        ) : (
+        <>
+        <div style={S.statsRow}>
+          <Stat n={stats.total} label="projets" color={theme.ink} />
+          <Stat n={stats["en cours"]} label="en cours" color={theme.violet} />
+          <Stat n={stats["en pause"]} label="en pause" color={theme.amber} />
+          <Stat n={stats.publiés} label="finis / publiés" color={theme.green} />
+        </div>
 
         <section style={S.copilot}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
@@ -511,10 +549,11 @@ export default function App() {
           </div>
         )}
 
-        <Tasks onLocked={() => setLocked(true)} />
+        </>
+        )}
 
         <footer style={S.footer}>
-          Données synchronisées entre tes appareils via le serveur. Le copilote ne voit que ce qui est saisi ici — pas ton GitHub ni tes projets ChatGPT, à ajouter à la main.
+          Données synchronisées entre tes appareils via le serveur. Le copilote ne voit que les projets saisis ici — pas ton GitHub, pas tes projets ChatGPT, pas tes tâches.
         </footer>
       </div>
 
@@ -607,7 +646,10 @@ const S = {
   wrap: { maxWidth: 1160, margin: "0 auto", padding: "36px 22px 60px" },
   h1: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 40, fontWeight: 700, letterSpacing: "-0.02em", margin: 0, color: theme.ink },
   subtitle: { fontFamily: "Inter", fontSize: 15, color: theme.mute },
-  statsRow: { display: "flex", gap: 26, marginTop: 16, flexWrap: "wrap" },
+  statsRow: { display: "flex", gap: 26, marginBottom: 22, flexWrap: "wrap" },
+  tabs: { display: "flex", gap: 6, marginBottom: 20, background: "#E7E8F1", borderRadius: 13, padding: 4, width: "fit-content", maxWidth: "100%" },
+  tab: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 14.5, fontWeight: 600, padding: "9px 18px", borderRadius: 10, border: "none", background: "transparent", color: theme.mute, cursor: "pointer", whiteSpace: "nowrap" },
+  tabOn: { background: theme.violet, color: "#FFFFFF", boxShadow: "0 2px 8px rgba(91,61,245,.28)" },
   stat: { display: "flex", flexDirection: "column" },
   statN: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 26, fontWeight: 700, lineHeight: 1 },
   statL: { fontSize: 12.5, color: theme.mute, marginTop: 3, textTransform: "uppercase", letterSpacing: ".04em" },
