@@ -14,6 +14,10 @@ export const theme = {
   statusViolet: "#6B2FB5", statusVioletSoft: "#F1E6FB",
   doneGrey: "#5A5972", doneGreySoft: "#EBECF2",
 
+  // Catégorie « boulot » : un bleu franc, distinct du teal (perso), de
+  // l'ambre (admin) et du violet (dev).
+  work: "#1B5490", workSoft: "#E3EDF9",
+
   // Urgence : un rouge franc, volontairement distinct de l'orange
   // « à faire » (plus jaune) pour que les deux ne se confondent pas.
   red: "#C51F1F", redSoft: "#FBE5E3",

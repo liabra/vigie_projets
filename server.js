@@ -61,11 +61,16 @@ async function ensureTable() {
     due_all_day boolean NOT NULL DEFAULT true,
     urgency text NOT NULL DEFAULT 'normale',
     calendar_event_id text,
+    calendar_id text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
   )`);
   // Ajouté après coup : les tâches déjà en base passent à 'normale'.
   await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS urgency text NOT NULL DEFAULT 'normale'");
+  // Agenda où l'événement a réellement été créé. NULL sur les tâches
+  // d'avant le routage : elles sont toutes dans l'agenda « Vigie », et
+  // google.js sait le déduire.
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS calendar_id text");
   // user_id : un seul 'owner' aujourd'hui, la clé est là pour plus tard.
   await pool.query(`CREATE TABLE IF NOT EXISTS google_auth (
     user_id text PRIMARY KEY,
@@ -102,7 +107,8 @@ let memTasks = [];
 let memAuth = null;
 let memSettings = new Map();
 
-const CATEGORIES = ["perso", "admin", "dev"];
+// La catégorie décide de l'agenda de destination : voir google.js.
+const CATEGORIES = ["perso", "admin", "dev", "boulot"];
 const TASK_STATUSES = ["a_faire", "en_cours", "fait"];
 // Urgence : purement interne à Vigie. Elle ne part JAMAIS vers l'agenda
 // Google — voir buildEventBody dans google.js, qui ne lit pas ce champ.
@@ -157,9 +163,9 @@ async function getTask(id) {
 async function insertTask(t) {
   if (!pool) { memTasks.push(t); return t; }
   await pool.query(
-    `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, urgency, calendar_event_id, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.created_at, t.updated_at]
+    `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, urgency, calendar_event_id, calendar_id, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id, t.created_at, t.updated_at]
   );
   return t;
 }
@@ -167,8 +173,8 @@ async function writeTask(t) {
   if (!pool) { memTasks = memTasks.map((x) => (x.id === t.id ? t : x)); return t; }
   await pool.query(
     `UPDATE tasks SET title=$2, category=$3, status=$4, due_date=$5, due_all_day=$6,
-       urgency=$7, calendar_event_id=$8, updated_at=$9 WHERE id=$1`,
-    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.updated_at]
+       urgency=$7, calendar_event_id=$8, calendar_id=$9, updated_at=$10 WHERE id=$1`,
+    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id, t.updated_at]
   );
   return t;
 }
@@ -187,6 +193,7 @@ const taskToJson = (t) => ({
   dueAllDay: t.due_all_day,
   urgency: t.urgency || "normale",
   calendarEventId: t.calendar_event_id || null,
+  calendarId: t.calendar_id || null,
   createdAt: t.created_at ? new Date(t.created_at).toISOString() : null,
   updatedAt: t.updated_at ? new Date(t.updated_at).toISOString() : null,
 });
@@ -208,15 +215,23 @@ const gcal = createGoogle({ loadAuth, saveAuth, getSetting, setSetting });
 // enregistrée, et repartira à la prochaine modification.
 async function syncTask(task) {
   try {
-    const { eventId, skipped } = await gcal.syncTask(task);
+    const { eventId, calendarId, skipped } = await gcal.syncTask(task);
     if (skipped) return null;
-    if ((eventId || null) !== (task.calendar_event_id || null)) {
+    // On garde le couple (agenda, événement) : c'est le seul moyen de
+    // savoir plus tard où patcher ou supprimer.
+    if ((eventId || null) !== (task.calendar_event_id || null) ||
+        (calendarId || null) !== (task.calendar_id || null)) {
       task.calendar_event_id = eventId || null;
+      task.calendar_id = eventId ? calendarId || null : null;
       await writeTask(task);
     }
     return null;
   } catch (e) {
     console.error("Google Agenda:", e.message);
+    if (gcal.isScopeError(e)) {
+      return "Tâche enregistrée. L'agenda Google demande de nouveaux droits : " +
+        "clique « Reconnecter l'agenda Google » dans l'onglet Tâches.";
+    }
     return "Tâche enregistrée, mais l'agenda Google n'a pas suivi : " + e.message;
   }
 }
@@ -319,6 +334,7 @@ app.post("/api/tasks", auth, async (req, res) => {
     due_date: parseDue(b.dueDate, allDay),
     due_all_day: allDay,
     calendar_event_id: null,
+    calendar_id: null,
     created_at: now,
     updated_at: now,
   };
@@ -373,7 +389,7 @@ app.delete("/api/tasks/:id", auth, async (req, res) => {
     await deleteTask(task.id);
     let syncWarning = null;
     try {
-      await gcal.removeEvent(task.calendar_event_id);
+      await gcal.removeEvent(task.calendar_event_id, task.calendar_id);
     } catch (e) {
       console.error("Google Agenda:", e.message);
       syncWarning = "Tâche supprimée, mais l'événement d'agenda est peut-être resté.";

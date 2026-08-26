@@ -12,12 +12,16 @@ import Stat, { statsRow } from "./Stat.jsx";
 
 const CACHE_KEY = "vigie:tasks";
 
+// La catégorie décide aussi de l'agenda de destination (voir google.js) :
+// dev et boulot vont dans l'agenda « Vigie », perso et admin dans l'agenda
+// principal du compte Google.
 const CATEGORIES = {
-  perso: { label: "Perso", color: theme.teal, bg: "#E1F0F2" },
-  admin: { label: "Admin", color: theme.amber, bg: theme.amberSoft },
-  dev: { label: "Dev", color: theme.violet, bg: theme.violetSoft },
+  perso: { label: "Perso", color: theme.teal, bg: "#E1F0F2", agenda: "perso" },
+  admin: { label: "Admin", color: theme.amber, bg: theme.amberSoft, agenda: "perso" },
+  dev: { label: "Dev", color: theme.violet, bg: theme.violetSoft, agenda: "vigie" },
+  boulot: { label: "Boulot", color: theme.work, bg: theme.workSoft, agenda: "vigie" },
 };
-const CATEGORY_ORDER = ["perso", "admin", "dev"];
+const CATEGORY_ORDER = ["perso", "admin", "dev", "boulot"];
 
 // Le statut colore la carte entière (liseré + pastille). « Fait »
 // reprend le gris + ✓ de l'agenda, pour que les deux se ressemblent.
@@ -232,9 +236,10 @@ export default function Tasks({ onLocked }) {
       <div style={S.head}>
         <h2 style={S.h2}>Tâches</h2>
         <div style={{ marginLeft: "auto" }}>
-          {google && google.connected && (
+          {google && google.connected && !google.needsReconsent && (
             <span style={S.gOk}>
-              Agenda « {google.calendarName} » connecté
+              Agendas connectés
+              <button className="at-btn at-focus" style={S.gLink} onClick={connectGoogle}>reconnecter</button>
               <button className="at-btn at-focus" style={S.gLink} onClick={disconnectGoogle}>délier</button>
             </span>
           )}
@@ -244,6 +249,20 @@ export default function Tasks({ onLocked }) {
           {google && !google.configured && <span style={S.gOff}>Agenda Google non configuré</span>}
         </div>
       </div>
+
+      {google && google.connected && google.needsReconsent && (
+        <div style={S.warnBar}>
+          <span>
+            <strong>Nouveaux droits à accorder.</strong> Les tâches <em>perso</em> et
+            <em> admin</em> vont maintenant dans ton agenda principal, ce que l’autorisation
+            actuelle ne permet pas. Les tâches sont enregistrées, mais l’agenda ne suivra
+            qu’après un nouveau consentement.
+          </span>
+          <button className="at-btn at-focus" style={{ ...S.gBtn, marginLeft: "auto" }} onClick={connectGoogle}>
+            Reconnecter l’agenda Google
+          </button>
+        </div>
+      )}
 
       <div style={statsRow}>
         <Stat n={counts.total} label="tâches" color={theme.ink} />
@@ -350,7 +369,7 @@ export default function Tasks({ onLocked }) {
                   {t.dueDate && (
                     <div style={{ ...S.due, color: isLate(t) ? theme.red : theme.mute }}>
                       {isLate(t) ? "⚠ " : ""}{humanDate(t)}
-                      {t.calendarEventId ? " · agenda" : ""}
+                      {t.calendarEventId ? (t.calendarId === "primary" ? " · agenda perso" : " · agenda Vigie") : ""}
                     </div>
                   )}
                   <div style={S.cardActions}>
@@ -449,6 +468,11 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
             </select>
           </div>
         </div>
+        <div style={S.routeHint}>
+          {CATEGORIES[category]?.agenda === "vigie"
+            ? "Cette catégorie va dans l’agenda « Vigie »."
+            : "Cette catégorie va dans ton agenda principal."}
+        </div>
         <div style={{ marginTop: 12 }}>
           <label style={S.label}>Urgence (interne à Vigie — n’apparaît pas dans l’agenda)</label>
           <select className="at-focus" style={S.field} value={urgency} onChange={(e) => setUrgency(e.target.value)}>
@@ -504,6 +528,8 @@ const S = {
   filterLabel: { fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 700, letterSpacing: ".07em", textTransform: "uppercase", color: theme.mute, minWidth: 74, flexShrink: 0 },
   filterChips: { display: "flex", gap: 6, flexWrap: "wrap", minWidth: 0 },
   msg: { fontFamily: "Inter", fontSize: 12.5, color: theme.amber, marginBottom: 10 },
+  routeHint: { fontFamily: "Inter", fontSize: 11.5, color: theme.mute, marginTop: 7 },
+  warnBar: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", background: theme.amberSoft, border: "1px solid #F0DCB0", borderRadius: 11, padding: "10px 13px", marginBottom: 14, fontFamily: "Inter", fontSize: 13, color: theme.ink },
 
   grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 },
   card: { position: "relative", background: theme.panel, borderRadius: 14, border: "1px solid " + theme.line, overflow: "hidden", display: "flex" },

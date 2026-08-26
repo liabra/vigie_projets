@@ -62,18 +62,42 @@ synchronisées entre PC et téléphone.
 
 ---
 
-## Agenda Google — synchro à sens unique
+## Agenda Google — synchro à sens unique, deux destinations
 
-Vigie écrit les échéances de tâches dans **un agenda Google dédié qu'elle crée
-elle-même**, nommé « Vigie ».
+Vigie écrit les échéances de tâches dans Google Calendar. **La catégorie
+décide de l'agenda** :
 
-> **Sens unique, et un seul agenda.** Vigie *écrit* dans l'agenda « Vigie » :
-> elle n'y lit rien, ne remonte jamais un événement vers une tâche, et n'a
-> aucun accès à tes autres agendas. Le scope demandé est
-> `calendar.app.created`, qui limite l'accès aux seuls agendas créés par
-> l'application — tes agendas perso et pro restent invisibles, même en
-> lecture. Modifier un événement dans Google ne change donc **rien** dans
-> Vigie, et la prochaine modification de la tâche réécrira l'événement.
+| Catégorie | Destination |
+| --- | --- |
+| **Dev**, **Boulot** | l'agenda « Vigie », créé et possédé par l'app |
+| **Perso**, **Admin** | ton agenda principal (`primary`) |
+
+> **Sens unique.** Vigie *écrit*, ne lit jamais, et ne remonte jamais un
+> événement vers une tâche. Modifier un événement dans Google ne change donc
+> **rien** dans Vigie, et la prochaine modification de la tâche réécrira
+> l'événement.
+
+### Ce que Vigie peut toucher — et ce qui l'en empêche
+
+Écrire dans ton agenda principal impose le scope `calendar.events`, qui côté
+Google couvre les événements de **tous** tes agendas. C'est un vrai
+élargissement par rapport à `calendar.app.created` seul : la limite n'est
+plus posée par Google, elle est tenue par le code.
+
+La règle, dans [`google.js`](google.js) : **toute écriture vise un couple
+(`calendar_id`, `event_id`) que Vigie a elle-même créé et stocké sur la
+tâche.** Concrètement —
+
+- aucune énumération : ni `events.list`, ni `calendarList`, ni
+  `calendars.list`, nulle part dans le code ;
+- aucun événement sans id stocké n'est jamais lu, modifié ni supprimé ;
+- les seules opérations Calendar du projet sont `calendars.insert` (une
+  fois, pour créer l'agenda « Vigie »), `events.insert`, `events.update` et
+  `events.delete` — les trois dernières toujours sur un id stocké.
+
+Autrement dit, un événement de ton agenda principal que Vigie n'a pas créé
+lui est invisible en pratique : elle n'a aucun moyen d'en apprendre
+l'existence.
 
 Ce qui est synchronisé :
 
@@ -86,6 +110,9 @@ Ce qui est synchronisé :
 | échéance effacée | événement supprimé |
 | tâche supprimée | événement supprimé |
 | tâche **sans** échéance | aucun événement |
+| catégorie changée d'un agenda à l'autre | ancien événement supprimé, recréé sur le bon agenda |
+
+Tout cela vaut à l'identique sur les deux destinations.
 
 ### Mise en place (une fois)
 
@@ -105,8 +132,15 @@ Ce qui est synchronisé :
    - `GOOGLE_CLIENT_ID`
    - `GOOGLE_CLIENT_SECRET`
    - `GOOGLE_REDIRECT_URI` = la même URL qu'à l'étape 4.
-6. Redéploie, ouvre Vigie, section **Tâches** → **Connecter l'agenda Google**.
-   L'agenda « Vigie » est créé automatiquement au premier lien.
+6. Redéploie, ouvre Vigie, onglet **Tâches agenda** → **Connecter l'agenda
+   Google**. L'agenda « Vigie » est créé automatiquement au premier lien.
+
+> **Déjà connecté avant l'ajout des deux destinations ?** Il faut redonner le
+> consentement : l'ancien jeton ne porte que `calendar.app.created` et ne
+> permet pas d'écrire dans l'agenda principal. Vigie le détecte et affiche un
+> bandeau **Reconnecter l'agenda Google** dans l'onglet Tâches ; un clic
+> suffit. Les tâches continuent d'être enregistrées entre-temps, seule la
+> synchro attend.
 
 ### Comment Vigie retrouve son agenda
 
@@ -190,6 +224,9 @@ de [`server.js`](server.js), en dollars par million de tokens. Un seul endroit
 
 ## Limites — à garder en tête
 
+- Une tâche dont la catégorie change d'agenda voit son événement
+  **supprimé puis recréé** : l'identifiant d'événement change, et une
+  éventuelle invitation ou notification repart de zéro.
 - Le lien **Discussion** (`chatUrl`) est un raccourci **personnel** : une URL
   de conversation Claude ne s'ouvre que depuis le compte qui l'a créée. Elle
   ne donne rien à quelqu'un d'autre, et le copilote de Vigie n'y a pas accès
