@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { theme, authHeaders } from "./shared.js";
+import Stat, { statsRow } from "./Stat.jsx";
 
 // ─────────────────────────────────────────────────────────────
 //  Tâches — perso / admin / dev, avec échéance facultative.
@@ -210,9 +211,11 @@ export default function Tasks({ onLocked }) {
   };
 
   const list = tasks || [];
+  // Totaux sur TOUTES les tâches : la barre de stats ne bouge pas
+  // quand on filtre, comme celle des projets.
   const counts = useMemo(() => {
     const by = (s) => list.filter((t) => t.status === s).length;
-    return { a_faire: by("a_faire"), en_cours: by("en_cours"), fait: by("fait") };
+    return { total: list.length, a_faire: by("a_faire"), en_cours: by("en_cours"), fait: by("fait") };
   }, [list]);
 
   const filtered = useMemo(
@@ -228,9 +231,6 @@ export default function Tasks({ onLocked }) {
     <section style={S.wrap}>
       <div style={S.head}>
         <h2 style={S.h2}>Tâches</h2>
-        <span style={S.counts}>
-          {counts.a_faire} à faire · {counts.en_cours} en cours · {counts.fait} faites
-        </span>
         <div style={{ marginLeft: "auto" }}>
           {google && google.connected && (
             <span style={S.gOk}>
@@ -243,6 +243,13 @@ export default function Tasks({ onLocked }) {
           )}
           {google && !google.configured && <span style={S.gOff}>Agenda Google non configuré</span>}
         </div>
+      </div>
+
+      <div style={statsRow}>
+        <Stat n={counts.total} label="tâches" color={theme.ink} />
+        <Stat n={counts.a_faire} label="à faire" color={STATUSES.a_faire.color} />
+        <Stat n={counts.en_cours} label="en cours" color={STATUSES.en_cours.color} />
+        <Stat n={counts.fait} label="fait" color={STATUSES.fait.color} />
       </div>
 
       {/* Pas de <form> : un bouton et une touche Entrée suffisent. */}
@@ -283,27 +290,24 @@ export default function Tasks({ onLocked }) {
       </div>
 
       <div style={S.filters}>
-        <Chip active={statusFilter === "tous"} onClick={() => setStatusFilter("tous")}>Toutes</Chip>
-        {STATUS_ORDER.map((s) => (
-          <Chip key={s} active={statusFilter === s} color={STATUSES[s].color} onClick={() => setStatusFilter(s)}>{STATUSES[s].label}</Chip>
-        ))}
-        <span style={{ width: 10 }} />
-        <Chip active={catFilter === "toutes"} onClick={() => setCatFilter("toutes")}>Catégories</Chip>
-        {CATEGORY_ORDER.map((c) => (
-          <Chip key={c} active={catFilter === c} color={CATEGORIES[c].color} onClick={() => setCatFilter(c)}>{CATEGORIES[c].label}</Chip>
-        ))}
-        <span style={{ width: 10 }} />
-        <Chip active={urgFilter === "toutes"} onClick={() => setUrgFilter("toutes")}>Urgences</Chip>
-        {URGENCY_ORDER.map((u) => (
-          <Chip
-            key={u}
-            active={urgFilter === u}
-            color={u === "urgente" ? theme.red : u === "importante" ? theme.ink : theme.slate}
-            onClick={() => setUrgFilter(u)}
-          >
-            {URGENCIES[u].label}
-          </Chip>
-        ))}
+        <FilterRow label="Statut">
+          <Chip active={statusFilter === "tous"} onClick={() => setStatusFilter("tous")}>Toutes</Chip>
+          {STATUS_ORDER.map((s) => (
+            <Chip key={s} active={statusFilter === s} onClick={() => setStatusFilter(s)}>{STATUSES[s].label}</Chip>
+          ))}
+        </FilterRow>
+        <FilterRow label="Catégorie">
+          <Chip active={catFilter === "toutes"} onClick={() => setCatFilter("toutes")}>Toutes</Chip>
+          {CATEGORY_ORDER.map((c) => (
+            <Chip key={c} active={catFilter === c} onClick={() => setCatFilter(c)}>{CATEGORIES[c].label}</Chip>
+          ))}
+        </FilterRow>
+        <FilterRow label="Urgence">
+          <Chip active={urgFilter === "toutes"} onClick={() => setUrgFilter("toutes")}>Toutes</Chip>
+          {URGENCY_ORDER.map((u) => (
+            <Chip key={u} active={urgFilter === u} onClick={() => setUrgFilter(u)}>{URGENCIES[u].label}</Chip>
+          ))}
+        </FilterRow>
       </div>
 
       {msg && <div style={S.msg}>{msg}</div>}
@@ -371,15 +375,31 @@ export default function Tasks({ onLocked }) {
   );
 }
 
-function Chip({ active, color = theme.ink, onClick, children }) {
+// Une ligne de filtre = un intitulé de dimension (simple texte, JAMAIS
+// cliquable) suivi de ses pastilles. Le tout passe à la ligne sur mobile.
+function FilterRow({ label, children }) {
+  return (
+    <div style={S.filterRow}>
+      <span style={S.filterLabel}>{label}</span>
+      <div style={S.filterChips}>{children}</div>
+    </div>
+  );
+}
+
+// Pastille active en violet plein, comme l'onglet actif ; inactive en
+// simple contour. Une seule couleur d'état : ce qui est plein est choisi.
+function Chip({ active, onClick, children }) {
   return (
     <button
       className="at-btn at-focus"
       onClick={onClick}
+      aria-pressed={active}
       style={{
-        fontFamily: "Inter, sans-serif", fontSize: 13, fontWeight: 500, padding: "6px 12px",
-        borderRadius: 999, border: "1px solid " + (active ? color : theme.line),
-        background: active ? color : theme.panel, color: active ? "#fff" : theme.mute, cursor: "pointer",
+        fontFamily: "Inter, sans-serif", fontSize: 13, fontWeight: active ? 600 : 500,
+        padding: "6px 12px", borderRadius: 999,
+        border: "1px solid " + (active ? theme.violet : theme.line),
+        background: active ? theme.violet : theme.panel,
+        color: active ? "#FFFFFF" : theme.slate, cursor: "pointer",
       }}
     >
       {children}
@@ -467,7 +487,6 @@ const S = {
   wrap: { marginTop: 0 },
   head: { display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 14 },
   h2: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, fontWeight: 700, margin: 0, color: theme.ink, letterSpacing: "-0.01em" },
-  counts: { fontFamily: "Inter", fontSize: 13, color: theme.mute },
   gOk: { fontFamily: "Inter", fontSize: 12.5, color: theme.green, display: "inline-flex", alignItems: "center", gap: 8 },
   gOff: { fontFamily: "Inter", fontSize: 12.5, color: theme.mute },
   gLink: { fontFamily: "Inter", fontSize: 12, padding: "3px 9px", borderRadius: 999, border: "1px solid " + theme.line, background: theme.panel, color: theme.mute, cursor: "pointer" },
@@ -480,7 +499,10 @@ const S = {
   check: { fontFamily: "Inter", fontSize: 12.5, color: theme.mute, display: "inline-flex", alignItems: "center", gap: 5, whiteSpace: "nowrap" },
   addBtn: { fontFamily: "Inter", fontSize: 14, fontWeight: 600, padding: "10px 16px", borderRadius: 11, border: "none", background: theme.violet, color: "#fff", cursor: "pointer" },
 
-  filters: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 14 },
+  filters: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 },
+  filterRow: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
+  filterLabel: { fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 700, letterSpacing: ".07em", textTransform: "uppercase", color: theme.mute, minWidth: 74, flexShrink: 0 },
+  filterChips: { display: "flex", gap: 6, flexWrap: "wrap", minWidth: 0 },
   msg: { fontFamily: "Inter", fontSize: 12.5, color: theme.amber, marginBottom: 10 },
 
   grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 },

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { theme, setKey, authHeaders } from "./shared.js";
 import Tasks from "./Tasks.jsx";
+import Stat, { statsRow } from "./Stat.jsx";
 
 // ─────────────────────────────────────────────────────────────
 //  Vigie — suivi de projets avec copilote IA
@@ -387,7 +388,7 @@ export default function App() {
           <Tasks onLocked={() => setLocked(true)} />
         ) : (
         <>
-        <div style={S.statsRow}>
+        <div style={statsRow}>
           <Stat n={stats.total} label="projets" color={theme.ink} />
           <Stat n={stats["en cours"]} label="en cours" color={theme.violet} />
           <Stat n={stats["en pause"]} label="en pause" color={theme.amber} />
@@ -578,10 +579,6 @@ function Unlock({ onSubmit }) {
   );
 }
 
-function Stat({ n, label, color }) {
-  return (<div style={S.stat}><span style={{ ...S.statN, color }}>{n}</span><span style={S.statL}>{label}</span></div>);
-}
-
 function FilterChip({ active, color = theme.ink, onClick, children }) {
   return (
     <button className="at-btn at-focus" onClick={onClick} style={{ fontFamily: "Inter, sans-serif", fontSize: 13, fontWeight: 500, padding: "6px 12px", borderRadius: 999, border: "1px solid " + (active ? color : theme.line), background: active ? color : theme.panel, color: active ? "#fff" : theme.mute, cursor: "pointer" }}>
@@ -646,13 +643,9 @@ const S = {
   wrap: { maxWidth: 1160, margin: "0 auto", padding: "36px 22px 60px" },
   h1: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 40, fontWeight: 700, letterSpacing: "-0.02em", margin: 0, color: theme.ink },
   subtitle: { fontFamily: "Inter", fontSize: 15, color: theme.mute },
-  statsRow: { display: "flex", gap: 26, marginBottom: 22, flexWrap: "wrap" },
   tabs: { display: "flex", gap: 6, marginBottom: 20, background: "#E7E8F1", borderRadius: 13, padding: 4, width: "fit-content", maxWidth: "100%" },
   tab: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 14.5, fontWeight: 600, padding: "9px 18px", borderRadius: 10, border: "none", background: "transparent", color: theme.mute, cursor: "pointer", whiteSpace: "nowrap" },
   tabOn: { background: theme.violet, color: "#FFFFFF", boxShadow: "0 2px 8px rgba(91,61,245,.28)" },
-  stat: { display: "flex", flexDirection: "column" },
-  statN: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 26, fontWeight: 700, lineHeight: 1 },
-  statL: { fontSize: 12.5, color: theme.mute, marginTop: 3, textTransform: "uppercase", letterSpacing: ".04em" },
   syncMsg: { fontFamily: "Inter", fontSize: 12.5, color: theme.amber, marginTop: 12 },
 
   copilot: { background: "linear-gradient(135deg, #4B31E0, #6E4BF7)", borderRadius: 18, padding: 20, color: "#fff", marginBottom: 22, boxShadow: "0 12px 30px rgba(75,49,224,.22)" },
