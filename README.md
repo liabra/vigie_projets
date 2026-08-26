@@ -101,6 +101,24 @@ Ce qui est synchronisé :
 6. Redéploie, ouvre Vigie, section **Tâches** → **Connecter l'agenda Google**.
    L'agenda « Vigie » est créé automatiquement au premier lien.
 
+### Comment Vigie retrouve son agenda
+
+Le scope `calendar.app.created` interdit de **lister** les agendas du compte
+(`calendarList.list`, `calendars.list`) et d'accéder à `primary` : c'est
+justement ce qui garantit que Vigie ne voit rien d'autre. Elle ne peut donc
+pas chercher son agenda par son nom. À la place : `calendars.insert` une
+seule fois, et l'id retourné est gardé dans la table `app_settings`
+(clé `google_calendar_id`). Tous les événements ciblent ensuite cet id.
+
+Deux conséquences à connaître :
+
+- si tu supprimes l'agenda « Vigie » côté Google, Vigie s'en aperçoit à la
+  première écriture (404) et en recrée un ;
+- si la ligne `google_calendar_id` disparaît de la base, Vigie crée un
+  **nouvel** agenda « Vigie » au lieu de retrouver l'ancien — elle n'a aucun
+  moyen de le reconnaître. L'ancien reste dans ton compte, à supprimer à la
+  main le cas échéant.
+
 Sans ces variables, tout le reste marche : les tâches s'enregistrent
 normalement, la synchro est simplement inactive. Idem si Google est injoignable
 — la tâche est gardée, un message discret le signale, et elle repartira à la

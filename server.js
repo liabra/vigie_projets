@@ -447,8 +447,17 @@ app.get("/oauth/callback", async (req, res) => {
     await gcal.handleCallback(String(code));
     res.redirect("/?google=ok");
   } catch (e) {
-    console.error("OAuth Google:", e);
-    res.status(500).send("Connexion Google échouée : " + e.message);
+    // e.gcalOp est posé par google.js : il nomme l'appel Calendar fautif
+    // (calendars.insert, events.update…) plutôt qu'un « 403 » anonyme.
+    const where = e.gcalOp ? "appel " + e.gcalOp : "échange du code OAuth";
+    console.error("OAuth Google — échec sur " + where + ":", e);
+    res.status(500).send(
+      "Connexion Google échouée pendant : " + where + "\n\n" + e.message +
+        (e.code === 403
+          ? "\n\nUn 403 ici veut dire que cette opération sort du scope demandé " +
+            "(calendar.app.created), qui ne donne accès qu'aux agendas créés par Vigie."
+          : "")
+    );
   }
 });
 

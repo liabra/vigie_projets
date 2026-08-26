@@ -97,12 +97,41 @@ export function createGoogle(store) {
     return c;
   }
 
+  // Tout appel à l'API passe par ici : en cas d'échec, le log dit
+  // EXACTEMENT quelle opération a échoué, et l'erreur porte ce nom.
+  async function callCalendar(op, fn) {
+    try {
+      return await fn();
+    } catch (e) {
+      const code = e?.code || e?.status;
+      const detail = e?.errors?.[0]?.message || e?.message || "";
+      if (code === 403) {
+        console.error(
+          `Google Agenda: ${op} → 403 (${detail}). Cette opération n'est PAS ` +
+            `couverte par le scope ${SCOPE} : seuls les agendas créés par l'app y sont accessibles.`
+        );
+      } else {
+        console.error(`Google Agenda: ${op} → ${code || "erreur"} (${detail})`);
+      }
+      e.gcalOp = op;
+      e.message = `${op} : ${detail || e.message}`;
+      throw e;
+    }
+  }
+
+  // 404 / 410 : l'objet visé (événement ou agenda) n'existe plus.
+  const isGone = (e) => e?.code === 404 || e?.code === 410 || e?.status === 404 || e?.status === 410;
+
   async function calendarApi() {
     const auth = await authed();
     return auth ? google.calendar({ version: "v3", auth }) : null;
   }
 
-  // Crée l'agenda « Vigie » s'il n'existe pas, et retient son id.
+  // Id de l'agenda « Vigie ». Le seul moyen de le retrouver est de
+  // l'avoir gardé : le scope calendar.app.created ne donne accès NI à
+  // calendarList.list, NI à calendars.list, NI à l'agenda primary. On
+  // ne cherche donc jamais l'agenda par son nom — on crée une fois, on
+  // mémorise l'id, on le réutilise.
   let cachedCalendarId = null;
   async function ensureCalendar() {
     if (cachedCalendarId) return cachedCalendarId;
@@ -111,24 +140,33 @@ export function createGoogle(store) {
 
     const known = await store.getSetting("google_calendar_id");
     if (known) {
-      try {
-        await cal.calendars.get({ calendarId: known });
-        cachedCalendarId = known;
-        return known;
-      } catch {
-        // Agenda supprimé côté Google : on en recrée un.
-        await store.setSetting("google_calendar_id", null);
-      }
+      cachedCalendarId = known;
+      return known;
     }
-    // calendarList ne renvoie ici que les agendas créés par l'app.
-    const list = await cal.calendarList.list({ maxResults: 250 });
-    const found = (list.data.items || []).find((c) => c.summary === CALENDAR_NAME);
-    const id = found
-      ? found.id
-      : (await cal.calendars.insert({ requestBody: { summary: CALENDAR_NAME, description: "Échéances des tâches Vigie." } })).data.id;
+    // Première fois : calendars.insert, couvert par le scope, et c'est
+    // sa réponse qui nous donne l'id à conserver.
+    const created = await callCalendar("calendars.insert", () =>
+      cal.calendars.insert({
+        requestBody: { summary: CALENDAR_NAME, description: "Échéances des tâches Vigie." },
+      })
+    );
+    const id = created.data.id;
     await store.setSetting("google_calendar_id", id);
     cachedCalendarId = id;
     return id;
+  }
+
+  // Id déjà connu, sans rien créer : pour les opérations qui n'ont de
+  // sens que si l'agenda existe déjà (suppression d'un événement).
+  async function knownCalendarId() {
+    return cachedCalendarId || (await store.getSetting("google_calendar_id")) || null;
+  }
+
+  // Oublie l'agenda mémorisé : appelé quand Google répond qu'il n'existe
+  // plus (supprimé à la main), pour en recréer un au prochain besoin.
+  async function forgetCalendar() {
+    cachedCalendarId = null;
+    await store.setSetting("google_calendar_id", null);
   }
 
   async function handleCallback(code) {
@@ -188,33 +226,52 @@ export function createGoogle(store) {
     }
 
     const requestBody = buildEventBody(task);
+
+    // Mise à jour de l'événement existant, dans l'agenda mémorisé.
     if (task.calendar_event_id) {
       try {
-        const r = await cal.events.update({
-          calendarId,
-          eventId: task.calendar_event_id,
-          requestBody,
-        });
+        const r = await callCalendar("events.update", () =>
+          cal.events.update({ calendarId, eventId: task.calendar_event_id, requestBody })
+        );
         return { eventId: r.data.id };
       } catch (e) {
-        if (e?.code !== 404 && e?.code !== 410) throw e;
-        // Événement effacé à la main dans l'agenda : on le recrée.
+        if (!isGone(e)) throw e;
+        // Événement (ou agenda) effacé à la main : on repart sur une création.
       }
     }
-    const r = await cal.events.insert({ calendarId, requestBody });
-    return { eventId: r.data.id };
+    return { eventId: (await insertEvent(requestBody, calendarId)).data.id };
+  }
+
+  // Création d'un événement, toujours dans l'agenda de l'app. Si Google
+  // répond que l'agenda n'existe plus, on en recrée un et on réessaie
+  // une fois — sans jamais aller chercher ailleurs dans le compte.
+  async function insertEvent(requestBody, calendarId) {
+    const cal = await calendarApi();
+    try {
+      return await callCalendar("events.insert", () => cal.events.insert({ calendarId, requestBody }));
+    } catch (e) {
+      if (!isGone(e)) throw e;
+      await forgetCalendar();
+      const fresh = await ensureCalendar();
+      if (!fresh) throw e;
+      return await callCalendar("events.insert (après recréation de l'agenda)", () =>
+        cal.events.insert({ calendarId: fresh, requestBody })
+      );
+    }
   }
 
   async function removeEvent(eventId, calendarId) {
     if (!eventId) return;
     const cal = await calendarApi();
     if (!cal) return;
-    const id = calendarId || (await ensureCalendar());
+    // Surtout pas ensureCalendar() ici : supprimer un événement ne doit
+    // jamais avoir pour effet de créer un agenda.
+    const id = calendarId || (await knownCalendarId());
     if (!id) return;
     try {
-      await cal.events.delete({ calendarId: id, eventId });
+      await callCalendar("events.delete", () => cal.events.delete({ calendarId: id, eventId }));
     } catch (e) {
-      if (e?.code !== 404 && e?.code !== 410) throw e; // déjà parti : très bien
+      if (!isGone(e)) throw e; // déjà parti : très bien
     }
   }
 
