@@ -1,16 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import { theme, setKey, authHeaders } from "./shared.js";
+import Tasks from "./Tasks.jsx";
 
 // ─────────────────────────────────────────────────────────────
 //  Vigie — suivi de projets avec copilote IA
 //  Synchro entre appareils via le serveur (/api/projects).
 //  Cache localStorage pour l'affichage instantané + hors-ligne.
 // ─────────────────────────────────────────────────────────────
-
-const theme = {
-  ink: "#1B1A2E", paper: "#F3F4FA", panel: "#FFFFFF", line: "#E4E5F1",
-  violet: "#5B3DF5", violetSoft: "#ECE8FF", amber: "#D9930A", amberSoft: "#FCF1DA",
-  green: "#11875B", greenSoft: "#DFF3E9", teal: "#2A7E8C", slate: "#5A6478", mute: "#6C6B85",
-};
 
 const STATUSES = {
   "idée":     { label: "Idée",     color: theme.slate,  bg: "#EAECF3" },
@@ -50,7 +46,6 @@ const SEED = [
 ].map((p) => ({ id: uid(), updatedAt: Date.now(), ...p }));
 
 const CACHE_KEY = "vigie:projects";
-const APPKEY_KEY = "vigie:key";
 const PROFILE_KEY = "vigie:profil";
 const MODEL_KEY = "vigie:model";
 const COST_KEY = "vigie:coutTotal";
@@ -94,10 +89,6 @@ const repoUrl = (repo) => {
 const DEFAULT_PROFILE = "une développeuse indépendante francophone qui construit ses apps en dialoguant avec l'IA";
 const getProfile = () => { try { return localStorage.getItem(PROFILE_KEY) ?? DEFAULT_PROFILE; } catch { return DEFAULT_PROFILE; } };
 const saveProfile = (v) => { try { localStorage.setItem(PROFILE_KEY, v); } catch {} };
-
-const getKey = () => { try { return localStorage.getItem(APPKEY_KEY) || ""; } catch { return ""; } };
-const setKey = (k) => { try { localStorage.setItem(APPKEY_KEY, k); } catch {} };
-const authHeaders = () => { const k = getKey(); return k ? { "x-app-key": k } : {}; };
 
 const cache = {
   load() { try { const r = localStorage.getItem(CACHE_KEY); return r ? JSON.parse(r) : null; } catch { return null; } },
@@ -519,6 +510,8 @@ export default function App() {
             })}
           </div>
         )}
+
+        <Tasks onLocked={() => setLocked(true)} />
 
         <footer style={S.footer}>
           Données synchronisées entre tes appareils via le serveur. Le copilote ne voit que ce qui est saisi ici — pas ton GitHub ni tes projets ChatGPT, à ajouter à la main.

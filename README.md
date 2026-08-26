@@ -1,9 +1,9 @@
 # Vigie — suivi de projets avec copilote IA
 
-Tableau de bord perso pour garder tous tes projets au même endroit, avec un
-copilote Claude qui raisonne sur ta liste. Front React + Vite (PWA) servi par
-un petit serveur Express, données rangées dans PostgreSQL et synchronisées
-entre PC et téléphone.
+Tableau de bord perso pour garder tes **projets** et tes **tâches** au même
+endroit, avec un copilote Claude qui raisonne sur ta liste. Front React + Vite
+(PWA) servi par un petit serveur Express, données rangées dans PostgreSQL et
+synchronisées entre PC et téléphone.
 
 - **Synchro PC + téléphone** : les données vivent dans une base côté serveur,
   donc la même liste partout. Un cache local garde l'affichage instantané et
@@ -20,6 +20,9 @@ entre PC et téléphone.
   (max). Le choix est gardé sur l'appareil.
 - **Raccourcis par projet** : chaque carte peut afficher **Code** (le repo),
   **Ouvrir** (le site en ligne) et **Discussion** (la conversation Claude).
+- **Tâches** : perso / admin / dev, filtrables par statut et par catégorie,
+  avec une échéance facultative. Celles qui ont une échéance sont poussées
+  dans un agenda Google dédié (voir plus bas).
 
 ---
 
@@ -52,6 +55,60 @@ entre PC et téléphone.
 
 ---
 
+## Agenda Google — synchro à sens unique
+
+Vigie écrit les échéances de tâches dans **un agenda Google dédié qu'elle crée
+elle-même**, nommé « Vigie ».
+
+> **Sens unique, et un seul agenda.** Vigie *écrit* dans l'agenda « Vigie » :
+> elle n'y lit rien, ne remonte jamais un événement vers une tâche, et n'a
+> aucun accès à tes autres agendas. Le scope demandé est
+> `calendar.app.created`, qui limite l'accès aux seuls agendas créés par
+> l'application — tes agendas perso et pro restent invisibles, même en
+> lecture. Modifier un événement dans Google ne change donc **rien** dans
+> Vigie, et la prochaine modification de la tâche réécrira l'événement.
+
+Ce qui est synchronisé :
+
+| Dans Vigie | Dans l'agenda « Vigie » |
+| --- | --- |
+| tâche créée avec une échéance | événement créé (journée entière, ou 30 min si tu décoches « journée ») |
+| échéance modifiée | événement déplacé |
+| statut passé à **Fait** | événement **grisé** et titre préfixé « ✓ » |
+| retour à **À faire** / **En cours** | gris et « ✓ » retirés |
+| échéance effacée | événement supprimé |
+| tâche supprimée | événement supprimé |
+| tâche **sans** échéance | aucun événement |
+
+### Mise en place (une fois)
+
+1. Sur [console.cloud.google.com](https://console.cloud.google.com) : crée un
+   projet (n'importe quel nom).
+2. **APIs & Services → Library** → active **Google Calendar API**.
+3. **APIs & Services → OAuth consent screen** : type **External**, remplis le
+   nom de l'app et ton adresse. Ajoute-toi comme utilisateur de test, puis
+   **publie l'app en Production**. Sans vérification Google elle reste marquée
+   « non vérifiée » : c'est normal pour un usage perso, tu passeras par
+   *Paramètres avancés → Continuer vers…* au consentement. Publier évite que
+   le refresh token expire au bout de 7 jours (limite du mode Testing).
+4. **Credentials → Create credentials → OAuth client ID**, type **Web
+   application**. Dans *Authorized redirect URIs*, mets exactement :
+   `https://<ton-domaine-railway>/oauth/callback`
+5. Copie les 3 valeurs dans les **Variables** Railway :
+   - `GOOGLE_CLIENT_ID`
+   - `GOOGLE_CLIENT_SECRET`
+   - `GOOGLE_REDIRECT_URI` = la même URL qu'à l'étape 4.
+6. Redéploie, ouvre Vigie, section **Tâches** → **Connecter l'agenda Google**.
+   L'agenda « Vigie » est créé automatiquement au premier lien.
+
+Sans ces variables, tout le reste marche : les tâches s'enregistrent
+normalement, la synchro est simplement inactive. Idem si Google est injoignable
+— la tâche est gardée, un message discret le signale, et elle repartira à la
+prochaine modification. Le bouton **délier** coupe le lien : les tâches
+restent, l'agenda cesse de bouger.
+
+---
+
 ## Tester en local
 
 Sans `DATABASE_URL`, l'app utilise le stockage en mémoire (remis à zéro à
@@ -69,6 +126,10 @@ Développement avec rechargement à chaud (deux terminaux) :
 ANTHROPIC_API_KEY=sk-ant-... npm start   # serveur, port 3000
 npm run dev                              # Vite, port 5173 (proxy /api → 3000)
 ```
+
+Le flux OAuth Google, lui, a besoin d'une URL publique : en local, il ne
+fonctionne que si `GOOGLE_REDIRECT_URI` pointe vers une adresse que Google peut
+rappeler (un tunnel type ngrok). Les tâches, elles, marchent sans.
 
 Le serveur lit les variables d'environnement du processus (pas de `dotenv`) :
 passe-les en ligne comme ci-dessus, ou via `export`. Voir `.env.example` pour
@@ -111,6 +172,7 @@ de [`server.js`](server.js), en dollars par million de tokens. Un seul endroit
 - Le lien **Ouvrir** (`liveUrl`) et le lien **Code** (`repo`, une URL complète
   ou un raccourci `owner/name` transformé en lien GitHub) n'apparaissent que
   si le champ est rempli.
+- Le copilote ne voit que les **projets**, pas les tâches ni l'agenda.
 - Le copilote ne voit **que** la liste saisie dans l'app. Pas d'accès à
   GitHub, ni à tes conversations ChatGPT, ni au vrai code. Ce qui n'est pas
   écrit dans une fiche projet n'existe pas pour lui.
