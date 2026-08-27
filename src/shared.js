@@ -14,9 +14,18 @@ export const theme = {
   statusViolet: "#6B2FB5", statusVioletSoft: "#F1E6FB",
   doneGrey: "#5A5972", doneGreySoft: "#EBECF2",
 
+  // Ambre assombri, réservé au tag « Admin » : #D9930A plafonnait à
+  // 2,30:1 sur son fond crème. Même famille, 4,83:1 — dans la bande des
+  // autres tags (à faire 4,93 · dev 5,12 · boulot 6,53).
+  amberDeep: "#8F6100",
+
   // Catégorie « boulot » : un bleu franc, distinct du teal (perso), de
   // l'ambre (admin) et du violet (dev).
   work: "#1B5490", workSoft: "#E3EDF9",
+
+  // Statut « idée » des articles : indigo ardoise, distinct du bleu
+  // « boulot » comme du violet « en cours ».
+  indigo: "#45528A", indigoSoft: "#E8EAF4",
 
   // Urgence : un rouge franc, volontairement distinct de l'orange
   // « à faire » (plus jaune) pour que les deux ne se confondent pas.

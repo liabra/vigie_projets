@@ -34,6 +34,13 @@ const SCOPES = [
   "https://www.googleapis.com/auth/calendar.events",
 ];
 const CALENDAR_NAME = "Vigie";
+const ARTICLES_CALENDAR_NAME = "Vigie – Articles";
+// Chaque agenda app-created : son nom, sa description, et la clé sous
+// laquelle son id est mémorisé.
+const APP_CALENDARS = {
+  tasks: { key: "google_calendar_id", name: CALENDAR_NAME, description: "Échéances des tâches Vigie." },
+  articles: { key: "google_articles_calendar_id", name: ARTICLES_CALENDAR_NAME, description: "Dates de sortie des articles Vigie." },
+};
 const GRAPHITE = "8"; // colorId « Graphite » (gris) des événements
 
 // Agenda principal de l'utilisateur : destination des tâches perso/admin.
@@ -77,6 +84,20 @@ export function buildEventBody(task) {
     body.start = { dateTime: start.toISOString() };
     body.end = { dateTime: new Date(start.getTime() + 30 * 60000).toISOString() };
   }
+  return body;
+}
+
+// Un article est toujours une journée entière, à sa date de sortie.
+// « En ligne » se lit comme une tâche faite : ✓ et gris.
+export function buildArticleEventBody(article) {
+  const online = article.status === "en_ligne";
+  const body = {
+    summary: (online ? "✓ " : "") + article.title,
+    description: "Article Vigie",
+    start: { date: ymd(article.release_date) },
+    end: { date: nextDay(article.release_date) },
+  };
+  if (online) body.colorId = GRAPHITE;
   return body;
 }
 
@@ -163,41 +184,44 @@ export function createGoogle(store) {
   // calendarList.list, NI à calendars.list, NI à l'agenda primary. On
   // ne cherche donc jamais l'agenda par son nom — on crée une fois, on
   // mémorise l'id, on le réutilise.
-  let cachedCalendarId = null;
-  async function ensureCalendar() {
-    if (cachedCalendarId) return cachedCalendarId;
+  // Un cache par agenda de l'app (tâches, articles).
+  const cachedIds = {};
+  async function ensureAppCalendar(which) {
+    const spec = APP_CALENDARS[which];
+    if (cachedIds[spec.key]) return cachedIds[spec.key];
     const cal = await calendarApi();
     if (!cal) return null;
 
-    const known = await store.getSetting("google_calendar_id");
+    const known = await store.getSetting(spec.key);
     if (known) {
-      cachedCalendarId = known;
+      cachedIds[spec.key] = known;
       return known;
     }
     // Première fois : calendars.insert, couvert par le scope, et c'est
     // sa réponse qui nous donne l'id à conserver.
-    const created = await callCalendar("calendars.insert", () =>
-      cal.calendars.insert({
-        requestBody: { summary: CALENDAR_NAME, description: "Échéances des tâches Vigie." },
-      })
+    const created = await callCalendar(`calendars.insert (${spec.name})`, () =>
+      cal.calendars.insert({ requestBody: { summary: spec.name, description: spec.description } })
     );
     const id = created.data.id;
-    await store.setSetting("google_calendar_id", id);
-    cachedCalendarId = id;
+    await store.setSetting(spec.key, id);
+    cachedIds[spec.key] = id;
     return id;
   }
+  const ensureCalendar = () => ensureAppCalendar("tasks");
+  const ensureArticlesCalendar = () => ensureAppCalendar("articles");
 
   // Id déjà connu, sans rien créer : pour les opérations qui n'ont de
   // sens que si l'agenda existe déjà (suppression d'un événement).
   async function knownCalendarId() {
-    return cachedCalendarId || (await store.getSetting("google_calendar_id")) || null;
+    return cachedIds[APP_CALENDARS.tasks.key] || (await store.getSetting(APP_CALENDARS.tasks.key)) || null;
   }
 
   // Oublie l'agenda mémorisé : appelé quand Google répond qu'il n'existe
   // plus (supprimé à la main), pour en recréer un au prochain besoin.
-  async function forgetCalendar() {
-    cachedCalendarId = null;
-    await store.setSetting("google_calendar_id", null);
+  async function forgetCalendar(which = "tasks") {
+    const spec = APP_CALENDARS[which];
+    delete cachedIds[spec.key];
+    await store.setSetting(spec.key, null);
   }
 
   async function handleCallback(code) {
@@ -242,9 +266,11 @@ export function createGoogle(store) {
   }
 
   async function disconnect() {
-    cachedCalendarId = null;
+    for (const spec of Object.values(APP_CALENDARS)) {
+      delete cachedIds[spec.key];
+      await store.setSetting(spec.key, null);
+    }
     await store.saveAuth(null);
-    await store.setSetting("google_calendar_id", null);
     await store.setSetting("google_scopes", null);
   }
 
@@ -307,20 +333,56 @@ export function createGoogle(store) {
     return { eventId: created.data.id, calendarId: created.calendarId };
   }
 
+  // Même schéma que syncTask, mais la destination ne dépend de rien :
+  // toujours l'agenda « Vigie – Articles ».
+  async function syncArticle(article) {
+    const cal = await calendarApi();
+    const untouched = { eventId: article.calendar_event_id || null, calendarId: article.calendar_id || null, skipped: true };
+    if (!cal) return untouched;
+
+    const target = await ensureArticlesCalendar();
+    if (!target) return untouched;
+
+    // L'agenda où vit l'événement déjà créé — jamais deviné.
+    const current = article.calendar_event_id ? article.calendar_id || target : null;
+
+    // Plus de date de sortie → plus d'événement.
+    if (!article.release_date) {
+      if (article.calendar_event_id) await removeEvent(article.calendar_event_id, current);
+      return { eventId: null, calendarId: null };
+    }
+
+    const requestBody = buildArticleEventBody(article);
+
+    if (article.calendar_event_id && current) {
+      try {
+        const r = await callCalendar("events.update (article)", () =>
+          cal.events.update({ calendarId: current, eventId: article.calendar_event_id, requestBody })
+        );
+        return { eventId: r.data.id, calendarId: current };
+      } catch (e) {
+        if (!isGone(e)) throw e;
+        // Événement effacé à la main : on repart sur une création.
+      }
+    }
+    const created = await insertEvent(requestBody, target, "articles");
+    return { eventId: created.data.id, calendarId: created.calendarId };
+  }
+
   // Création d'un événement, toujours dans l'agenda de l'app. Si Google
   // répond que l'agenda n'existe plus, on en recrée un et on réessaie
   // une fois — sans jamais aller chercher ailleurs dans le compte.
-  async function insertEvent(requestBody, calendarId) {
+  async function insertEvent(requestBody, calendarId, which = "tasks") {
     const cal = await calendarApi();
     try {
       const r = await callCalendar("events.insert", () => cal.events.insert({ calendarId, requestBody }));
       return { data: r.data, calendarId };
     } catch (e) {
       // Le repli « l'agenda a disparu, on le recrée » n'a de sens que pour
-      // l'agenda de l'app : primary, lui, ne disparaît pas.
+      // les agendas de l'app : primary, lui, ne disparaît pas.
       if (!isGone(e) || calendarId === PRIMARY) throw e;
-      await forgetCalendar();
-      const fresh = await ensureCalendar();
+      await forgetCalendar(which);
+      const fresh = await ensureAppCalendar(which);
       if (!fresh) throw e;
       const r = await callCalendar("events.insert (après recréation de l'agenda)", () =>
         cal.events.insert({ calendarId: fresh, requestBody })
@@ -348,7 +410,7 @@ export function createGoogle(store) {
 
   return {
     configured, consentUrl, handleCallback, status, disconnect,
-    ensureCalendar, syncTask, removeEvent, isScopeError,
-    SCOPES, CALENDAR_NAME, PRIMARY,
+    ensureCalendar, ensureArticlesCalendar, syncTask, syncArticle, removeEvent, isScopeError,
+    SCOPES, CALENDAR_NAME, ARTICLES_CALENDAR_NAME, PRIMARY,
   };
 }

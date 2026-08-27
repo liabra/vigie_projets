@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { theme, setKey, authHeaders } from "./shared.js";
 import Tasks from "./Tasks.jsx";
+import Articles from "./Articles.jsx";
 import Stat, { statsRow } from "./Stat.jsx";
 
 // ─────────────────────────────────────────────────────────────
@@ -50,6 +51,11 @@ const CACHE_KEY = "vigie:projects";
 const PROFILE_KEY = "vigie:profil";
 const MODEL_KEY = "vigie:model";
 const TAB_KEY = "vigie:onglet";
+const TABS = [
+  { id: "projets", label: "Projets dev" },
+  { id: "taches", label: "Tâches agenda" },
+  { id: "articles", label: "Articles" },
+];
 const COST_KEY = "vigie:coutTotal";
 
 // Modèles proposés. Les IDs doivent rester alignés sur la liste blanche
@@ -154,7 +160,8 @@ export default function App() {
   const [tab, setTab] = useState(() => {
     try {
       if (new URLSearchParams(window.location.search).has("google")) return "taches";
-      return localStorage.getItem(TAB_KEY) === "taches" ? "taches" : "projets";
+      const saved = localStorage.getItem(TAB_KEY);
+      return TABS.some((t) => t.id === saved) ? saved : "projets";
     } catch { return "projets"; }
   });
   const [syncMsg, setSyncMsg] = useState("");
@@ -364,28 +371,24 @@ export default function App() {
         </header>
 
         <div style={S.tabs} role="tablist">
-          <button
-            className="at-btn at-focus"
-            role="tab"
-            aria-selected={tab === "projets"}
-            style={{ ...S.tab, ...(tab === "projets" ? S.tabOn : null) }}
-            onClick={() => goTab("projets")}
-          >
-            Projets dev
-          </button>
-          <button
-            className="at-btn at-focus"
-            role="tab"
-            aria-selected={tab === "taches"}
-            style={{ ...S.tab, ...(tab === "taches" ? S.tabOn : null) }}
-            onClick={() => goTab("taches")}
-          >
-            Tâches agenda
-          </button>
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              className="at-btn at-focus"
+              role="tab"
+              aria-selected={tab === t.id}
+              style={{ ...S.tab, ...(tab === t.id ? S.tabOn : null) }}
+              onClick={() => goTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
 
         {tab === "taches" ? (
           <Tasks onLocked={() => setLocked(true)} />
+        ) : tab === "articles" ? (
+          <Articles onLocked={() => setLocked(true)} />
         ) : (
         <>
         <div style={statsRow}>

@@ -20,8 +20,13 @@ synchronisées entre PC et téléphone.
   (max). Le choix est gardé sur l'appareil.
 - **Raccourcis par projet** : chaque carte peut afficher **Code** (le repo),
   **Ouvrir** (le site en ligne) et **Discussion** (la conversation Claude).
-- **Deux onglets** : *Projets dev* (les cartes projet et le copilote) et
-  *Tâches agenda*. L'onglet ouvert est retenu d'une visite à l'autre.
+- **Trois onglets** : *Projets dev* (les cartes projet et le copilote),
+  *Tâches agenda* et *Articles*. L'onglet ouvert est retenu d'une visite à
+  l'autre.
+- **Articles** : suivi de rédaction, de l'idée à la mise en ligne (Idée →
+  Brouillon → Rédaction → En ligne), avec une date de sortie facultative et
+  jusqu'à trois liens par article (Prompt, Doc, NotebookLM), chacun affiché
+  seulement s'il est renseigné.
 - **Tâches** : perso / admin / dev, filtrables par statut, catégorie et
   urgence, avec une échéance facultative. Celles qui ont une échéance sont
   poussées dans un agenda Google dédié (voir plus bas).
@@ -67,10 +72,15 @@ synchronisées entre PC et téléphone.
 Vigie écrit les échéances de tâches dans Google Calendar. **La catégorie
 décide de l'agenda** :
 
-| Catégorie | Destination |
+| Ce qui est daté | Destination |
 | --- | --- |
-| **Dev**, **Boulot** | l'agenda « Vigie », créé et possédé par l'app |
-| **Perso**, **Admin** | ton agenda principal (`primary`) |
+| tâche **Dev**, **Boulot** | l'agenda « Vigie », créé et possédé par l'app |
+| tâche **Perso**, **Admin** | ton agenda principal (`primary`) |
+| **article** avec date de sortie | l'agenda « Vigie – Articles », créé et possédé par l'app |
+
+Les deux agendas de l'app sont créés au premier besoin et leurs identifiants
+mémorisés dans `app_settings` ; ils ne sont jamais retrouvés par leur nom
+(voir plus bas).
 
 > **Sens unique.** Vigie *écrit*, ne lit jamais, et ne remonte jamais un
 > événement vers une tâche. Modifier un événement dans Google ne change donc
@@ -91,9 +101,9 @@ tâche.** Concrètement —
 - aucune énumération : ni `events.list`, ni `calendarList`, ni
   `calendars.list`, nulle part dans le code ;
 - aucun événement sans id stocké n'est jamais lu, modifié ni supprimé ;
-- les seules opérations Calendar du projet sont `calendars.insert` (une
-  fois, pour créer l'agenda « Vigie »), `events.insert`, `events.update` et
-  `events.delete` — les trois dernières toujours sur un id stocké.
+- les seules opérations Calendar du projet sont `calendars.insert` (une fois
+  par agenda de l'app), `events.insert`, `events.update` et `events.delete` —
+  les deux dernières toujours sur un `eventId` stocké.
 
 Autrement dit, un événement de ton agenda principal que Vigie n'a pas créé
 lui est invisible en pratique : elle n'a aucun moyen d'en apprendre
@@ -110,6 +120,8 @@ Ce qui est synchronisé :
 | échéance effacée | événement supprimé |
 | tâche supprimée | événement supprimé |
 | tâche **sans** échéance | aucun événement |
+| article passé **En ligne** | événement grisé et titre préfixé « ✓ » |
+| article sans date de sortie | aucun événement |
 | catégorie changée d'un agenda à l'autre | ancien événement supprimé, recréé sur le bon agenda |
 
 Tout cela vaut à l'identique sur les deux destinations.
@@ -155,10 +167,10 @@ Deux conséquences à connaître :
 
 - si tu supprimes l'agenda « Vigie » côté Google, Vigie s'en aperçoit à la
   première écriture (404) et en recrée un ;
-- si la ligne `google_calendar_id` disparaît de la base, Vigie crée un
-  **nouvel** agenda « Vigie » au lieu de retrouver l'ancien — elle n'a aucun
-  moyen de le reconnaître. L'ancien reste dans ton compte, à supprimer à la
-  main le cas échéant.
+- si la ligne `google_calendar_id` (ou `google_articles_calendar_id`)
+  disparaît de la base, Vigie crée un **nouvel** agenda au lieu de retrouver
+  l'ancien — elle n'a aucun moyen de le reconnaître. L'ancien reste dans ton
+  compte, à supprimer à la main le cas échéant.
 
 Sans ces variables, tout le reste marche : les tâches s'enregistrent
 normalement, la synchro est simplement inactive. Idem si Google est injoignable

@@ -78,6 +78,19 @@ async function ensureTable() {
     access_token text,
     expiry timestamptz
   )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS articles (
+    id uuid PRIMARY KEY,
+    title text NOT NULL,
+    status text NOT NULL DEFAULT 'idee',
+    release_date timestamptz,
+    prompt_url text,
+    doc_url text,
+    notebooklm_url text,
+    calendar_event_id text,
+    calendar_id text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`);
   await pool.query("CREATE TABLE IF NOT EXISTS app_settings (key text PRIMARY KEY, value text)");
 }
 async function loadState() {
@@ -207,6 +220,76 @@ function parseDue(value, allDay) {
   return allDay ? new Date(d.toISOString().slice(0, 10) + "T00:00:00.000Z") : d;
 }
 
+// ── Articles ──────────────────────────────────────────────────
+const ARTICLE_STATUSES = ["idee", "brouillon", "redaction", "en_ligne"];
+let memArticles = [];
+
+// Une URL vide est acceptée (champ facultatif) ; sinon on exige une
+// adresse web — validation volontairement grossière, c'est un garde-fou
+// de saisie, pas un contrôle d'accès.
+function parseUrl(v) {
+  const u = (v || "").trim();
+  if (!u) return null;
+  return /^https?:\/\//i.test(u) ? u.slice(0, 2000) : undefined; // undefined = refus
+}
+
+async function listArticles() {
+  if (!pool) return [...memArticles].sort(sortArticles);
+  const r = await pool.query("SELECT * FROM articles");
+  return r.rows.sort(sortArticles);
+}
+// Sorties les plus proches en tête, sans date à la fin.
+function sortArticles(a, b) {
+  const da = a.release_date ? new Date(a.release_date).getTime() : Infinity;
+  const db = b.release_date ? new Date(b.release_date).getTime() : Infinity;
+  if (da !== db) return da - db;
+  return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+}
+async function getArticle(id) {
+  if (!pool) return memArticles.find((a) => a.id === id) || null;
+  const r = await pool.query("SELECT * FROM articles WHERE id = $1", [id]);
+  return r.rows[0] || null;
+}
+async function insertArticle(a) {
+  if (!pool) { memArticles.push(a); return a; }
+  await pool.query(
+    `INSERT INTO articles (id, title, status, release_date, prompt_url, doc_url, notebooklm_url,
+       calendar_event_id, calendar_id, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [a.id, a.title, a.status, a.release_date, a.prompt_url, a.doc_url, a.notebooklm_url,
+     a.calendar_event_id, a.calendar_id, a.created_at, a.updated_at]
+  );
+  return a;
+}
+async function writeArticle(a) {
+  if (!pool) { memArticles = memArticles.map((x) => (x.id === a.id ? a : x)); return a; }
+  await pool.query(
+    `UPDATE articles SET title=$2, status=$3, release_date=$4, prompt_url=$5, doc_url=$6,
+       notebooklm_url=$7, calendar_event_id=$8, calendar_id=$9, updated_at=$10 WHERE id=$1`,
+    [a.id, a.title, a.status, a.release_date, a.prompt_url, a.doc_url, a.notebooklm_url,
+     a.calendar_event_id, a.calendar_id, a.updated_at]
+  );
+  return a;
+}
+async function deleteArticle(id) {
+  if (!pool) { memArticles = memArticles.filter((a) => a.id !== id); return; }
+  await pool.query("DELETE FROM articles WHERE id = $1", [id]);
+}
+
+const articleToJson = (a) => ({
+  id: a.id,
+  title: a.title,
+  status: a.status,
+  releaseDate: a.release_date ? new Date(a.release_date).toISOString() : null,
+  promptUrl: a.prompt_url || null,
+  docUrl: a.doc_url || null,
+  notebooklmUrl: a.notebooklm_url || null,
+  calendarEventId: a.calendar_event_id || null,
+  calendarId: a.calendar_id || null,
+  createdAt: a.created_at ? new Date(a.created_at).toISOString() : null,
+  updatedAt: a.updated_at ? new Date(a.updated_at).toISOString() : null,
+});
+
 // ── Google Agenda (sens unique : Vigie écrit, ne lit rien d'autre) ─
 const gcal = createGoogle({ loadAuth, saveAuth, getSetting, setSetting });
 
@@ -308,6 +391,125 @@ app.post("/api/ask", auth, async (req, res) => {
   }
 });
 
+
+// Pousse la date de sortie d'un article vers l'agenda « Vigie – Articles ».
+// Ne lève jamais : sans compte Google lié, l'article vit sa vie.
+async function syncArticle(article) {
+  try {
+    const { eventId, calendarId, skipped } = await gcal.syncArticle(article);
+    if (skipped) return null;
+    if ((eventId || null) !== (article.calendar_event_id || null) ||
+        (calendarId || null) !== (article.calendar_id || null)) {
+      article.calendar_event_id = eventId || null;
+      article.calendar_id = eventId ? calendarId || null : null;
+      await writeArticle(article);
+    }
+    return null;
+  } catch (e) {
+    console.error("Google Agenda (articles):", e.message);
+    if (gcal.isScopeError(e)) {
+      return "Article enregistré. L'agenda Google demande de nouveaux droits : " +
+        "clique « Reconnecter l'agenda Google » dans l'onglet Tâches.";
+    }
+    return "Article enregistré, mais l'agenda Google n'a pas suivi : " + e.message;
+  }
+}
+
+// ── Articles (mêmes règles d'accès que /api/tasks) ────────────
+app.get("/api/articles", auth, async (_req, res) => {
+  try {
+    res.json({ articles: (await listArticles()).map(articleToJson) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Lecture des articles impossible." });
+  }
+});
+
+app.post("/api/articles", auth, async (req, res) => {
+  const b = req.body || {};
+  const title = typeof b.title === "string" ? b.title.trim() : "";
+  if (!title) return res.status(400).json({ error: "Titre manquant." });
+
+  const urls = {};
+  for (const [field, key] of [["promptUrl", "prompt_url"], ["docUrl", "doc_url"], ["notebooklmUrl", "notebooklm_url"]]) {
+    const u = parseUrl(b[field]);
+    if (u === undefined) return res.status(400).json({ error: "Lien invalide : il doit commencer par http:// ou https://." });
+    urls[key] = u;
+  }
+  const now = new Date();
+  const article = {
+    id: randomUUID(),
+    title: title.slice(0, 300),
+    status: ARTICLE_STATUSES.includes(b.status) ? b.status : "idee",
+    // Toujours une journée entière : on range à minuit UTC, comme les
+    // tâches « journée », pour que le jour ne glisse pas d'un fuseau.
+    release_date: parseDue(b.releaseDate, true),
+    ...urls,
+    calendar_event_id: null,
+    calendar_id: null,
+    created_at: now,
+    updated_at: now,
+  };
+  try {
+    await insertArticle(article);
+    const syncWarning = await syncArticle(article);
+    res.status(201).json({ article: articleToJson(article), syncWarning });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Création impossible." });
+  }
+});
+
+app.patch("/api/articles/:id", auth, async (req, res) => {
+  const b = req.body || {};
+  try {
+    const article = await getArticle(req.params.id);
+    if (!article) return res.status(404).json({ error: "Article introuvable." });
+
+    if (typeof b.title === "string") {
+      const t = b.title.trim();
+      if (!t) return res.status(400).json({ error: "Titre vide." });
+      article.title = t.slice(0, 300);
+    }
+    // Statut inconnu → 'idee', comme une catégorie inconnue devient 'perso'.
+    if (b.status !== undefined) article.status = ARTICLE_STATUSES.includes(b.status) ? b.status : "idee";
+    if (b.releaseDate !== undefined) article.release_date = parseDue(b.releaseDate, true);
+    for (const [field, key] of [["promptUrl", "prompt_url"], ["docUrl", "doc_url"], ["notebooklmUrl", "notebooklm_url"]]) {
+      if (b[field] === undefined) continue;
+      const u = parseUrl(b[field]);
+      if (u === undefined) return res.status(400).json({ error: "Lien invalide : il doit commencer par http:// ou https://." });
+      article[key] = u;
+    }
+    article.updated_at = new Date();
+
+    await writeArticle(article);
+    const syncWarning = await syncArticle(article);
+    res.json({ article: articleToJson(article), syncWarning });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Modification impossible." });
+  }
+});
+
+app.delete("/api/articles/:id", auth, async (req, res) => {
+  try {
+    const article = await getArticle(req.params.id);
+    if (!article) return res.status(404).json({ error: "Article introuvable." });
+    await deleteArticle(article.id);
+    let syncWarning = null;
+    try {
+      // Uniquement le couple stocké : jamais d'opération à l'aveugle.
+      await gcal.removeEvent(article.calendar_event_id, article.calendar_id);
+    } catch (e) {
+      console.error("Google Agenda (articles):", e.message);
+      syncWarning = "Article supprimé, mais l'événement d'agenda est peut-être resté.";
+    }
+    res.json({ ok: true, syncWarning });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Suppression impossible." });
+  }
+});
 
 // ── Tâches (mêmes règles d'accès que /api/projects) ───────────
 app.get("/api/tasks", auth, async (_req, res) => {
