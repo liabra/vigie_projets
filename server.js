@@ -38,6 +38,12 @@ function estimateCost(model, usage) {
 
 // ── Stockage : PostgreSQL si DATABASE_URL, sinon mémoire (dev) ─
 const { Pool } = pg;
+// Une colonne DATE est rendue par node-postgres en Date à minuit LOCAL :
+// depuis Paris, .toISOString() renverrait alors la VEILLE. start_date est
+// un jour, pas un instant — on le garde en texte « AAAA-MM-JJ » de bout en
+// bout. C'est la seule colonne DATE du schéma, le réglage est sans effet
+// ailleurs (tout le reste est en timestamptz).
+pg.types.setTypeParser(1082, (v) => v);
 let pool = null;
 if (process.env.DATABASE_URL) {
   const local = /localhost|127\.0\.0\.1|\.railway\.internal/.test(process.env.DATABASE_URL);
@@ -66,6 +72,8 @@ export async function ensureTable() {
     sync_status text NOT NULL DEFAULT 'pending',
     sync_error text,
     last_sync_attempt timestamptz,
+    start_date date,
+    start_event_id text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
   )`);
@@ -105,6 +113,12 @@ export async function ensureTable() {
     );
     if (done.rowCount) console.log(`Migration : ${done.rowCount} tâche(s) déjà synchronisée(s) marquée(s) 'synced'.`);
   }
+
+  // Jour de début facultatif, et le repère d'agenda qui lui correspond.
+  // Délibérément à part de calendar_event_id : ce repère est best-effort,
+  // il n'a ni sync_status, ni marqueur, ni réconciliation — voir syncStartMarker.
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS start_date date");
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS start_event_id text");
 
   // user_id : un seul 'owner' aujourd'hui, la clé est là pour plus tard.
   await pool.query(`CREATE TABLE IF NOT EXISTS google_auth (
@@ -212,10 +226,11 @@ async function insertTask(t) {
   if (!pool) { memTasks.push(t); return t; }
   await pool.query(
     `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, urgency, calendar_event_id, calendar_id,
-       sync_status, sync_error, last_sync_attempt, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+       sync_status, sync_error, last_sync_attempt, start_date, start_event_id, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id,
-     t.sync_status || "pending", t.sync_error ?? null, t.last_sync_attempt ?? null, t.created_at, t.updated_at]
+     t.sync_status || "pending", t.sync_error ?? null, t.last_sync_attempt ?? null,
+     t.start_date ?? null, t.start_event_id ?? null, t.created_at, t.updated_at]
   );
   return t;
 }
@@ -224,9 +239,11 @@ async function writeTask(t) {
   await pool.query(
     `UPDATE tasks SET title=$2, category=$3, status=$4, due_date=$5, due_all_day=$6,
        urgency=$7, calendar_event_id=$8, calendar_id=$9, updated_at=$10,
-       sync_status=$11, sync_error=$12, last_sync_attempt=$13 WHERE id=$1`,
+       sync_status=$11, sync_error=$12, last_sync_attempt=$13,
+       start_date=$14, start_event_id=$15 WHERE id=$1`,
     [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id, t.updated_at,
-     t.sync_status || "pending", t.sync_error ?? null, t.last_sync_attempt ?? null]
+     t.sync_status || "pending", t.sync_error ?? null, t.last_sync_attempt ?? null,
+     t.start_date ?? null, t.start_event_id ?? null]
   );
   return t;
 }
@@ -246,6 +263,9 @@ const taskToJson = (t) => ({
   urgency: t.urgency || "normale",
   calendarEventId: t.calendar_event_id || null,
   calendarId: t.calendar_id || null,
+  // Jour de début : un champ ordinaire, en lecture ET en écriture,
+  // contrairement aux champs sync_* juste en dessous.
+  startDate: t.start_date ? String(t.start_date).slice(0, 10) : null,
   // État de la synchro agenda, en lecture seule : le client l'affiche
   // (badge, message d'échec) mais ne le renvoie jamais — c'est la synchro
   // qui l'écrit, pas l'utilisateur. PATCH /api/tasks ignore ces champs.
@@ -255,6 +275,31 @@ const taskToJson = (t) => ({
   createdAt: t.created_at ? new Date(t.created_at).toISOString() : null,
   updatedAt: t.updated_at ? new Date(t.updated_at).toISOString() : null,
 });
+
+// Un jour de début est un JOUR, pas un instant : gardé en « AAAA-MM-JJ ».
+// undefined = valeur refusée, à distinguer de null = pas de début.
+function parseStart(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const s = String(value).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return undefined;
+  return Number.isNaN(new Date(s + "T00:00:00.000Z").getTime()) ? undefined : s;
+}
+
+// due_date est rangée à minuit UTC pour une journée entière : on lit donc
+// son jour en UTC, sinon la comparaison glisserait selon le fuseau.
+const dayOfUtc = (d) => new Date(d).toISOString().slice(0, 10);
+
+// Deux règles, et rien d'autre : un début n'a de sens qu'avec une échéance
+// en face, et il ne peut pas la dépasser. Renvoie le message d'erreur, ou
+// null si tout va bien.
+function startDateProblem(startDate, dueDate) {
+  if (!startDate) return null;
+  if (!dueDate) return "Un jour de début ne se donne qu'avec une échéance : ajoute une échéance, ou retire le début.";
+  if (startDate > dayOfUtc(dueDate)) {
+    return `Le jour de début (${startDate}) ne peut pas être après l'échéance (${dayOfUtc(dueDate)}).`;
+  }
+  return null;
+}
 
 // Une journée entière est rangée à minuit UTC : l'aller-retour
 // "2026-09-01" → base → agenda reste sur le même jour partout.
@@ -797,19 +842,26 @@ app.post("/api/tasks", auth, async (req, res) => {
   if (!title) return res.status(400).json({ error: "Titre manquant." });
   const now = new Date();
   const allDay = b.dueAllDay === undefined ? true : !!b.dueAllDay;
+  const startDate = parseStart(b.startDate);
+  if (startDate === undefined) return res.status(400).json({ error: "Jour de début invalide : attendu AAAA-MM-JJ." });
+  const dueDate = parseDue(b.dueDate, allDay);
+  const souci = startDateProblem(startDate, dueDate);
+  if (souci) return res.status(400).json({ error: souci });
   const task = {
     id: randomUUID(),
     title: title.slice(0, 300),
     category: CATEGORIES.includes(b.category) ? b.category : "perso",
     status: TASK_STATUSES.includes(b.status) ? b.status : "a_faire",
     urgency: URGENCIES.includes(b.urgency) ? b.urgency : "normale",
-    due_date: parseDue(b.dueDate, allDay),
+    due_date: dueDate,
     due_all_day: allDay,
     calendar_event_id: null,
     calendar_id: null,
     sync_status: "pending",
     sync_error: null,
     last_sync_attempt: null,
+    start_date: startDate,
+    start_event_id: null,
     created_at: now,
     updated_at: now,
   };
@@ -829,6 +881,29 @@ app.patch("/api/tasks/:id", auth, async (req, res) => {
     const task = await getTask(req.params.id);
     if (!task) return res.status(404).json({ error: "Tâche introuvable." });
 
+    // Dates calculées et validées AVANT d'écrire quoi que ce soit sur la
+    // tâche. En repli mémoire, getTask rend l'objet stocké lui-même : un
+    // refus survenant après une mutation laisserait la modification
+    // appliquée alors que la requête répond 400. Les validations qui
+    // suivent (titre, catégorie, statut) gardent déjà cet ordre.
+    const nextAllDay = b.dueAllDay !== undefined ? !!b.dueAllDay : task.due_all_day;
+    const nextDue =
+      b.dueDate !== undefined
+        ? parseDue(b.dueDate, nextAllDay)
+        : b.dueAllDay !== undefined && task.due_date
+        ? parseDue(task.due_date, nextAllDay)
+        : task.due_date;
+    let nextStart = task.start_date;
+    if (b.startDate !== undefined) {
+      const st = parseStart(b.startDate);
+      if (st === undefined) return res.status(400).json({ error: "Jour de début invalide : attendu AAAA-MM-JJ." });
+      nextStart = st;
+    }
+    // Validé sur l'état RÉSULTANT, pas sur le corps reçu : avancer la seule
+    // échéance peut rendre invalide un début déjà en base.
+    const souci = startDateProblem(nextStart, nextDue);
+    if (souci) return res.status(400).json({ error: souci });
+
     if (typeof b.title === "string") {
       const t = b.title.trim();
       if (!t) return res.status(400).json({ error: "Titre vide." });
@@ -843,9 +918,9 @@ app.patch("/api/tasks/:id", auth, async (req, res) => {
       task.status = b.status;
     }
     if (b.urgency !== undefined) task.urgency = URGENCIES.includes(b.urgency) ? b.urgency : "normale";
-    if (b.dueAllDay !== undefined) task.due_all_day = !!b.dueAllDay;
-    if (b.dueDate !== undefined) task.due_date = parseDue(b.dueDate, task.due_all_day);
-    else if (b.dueAllDay !== undefined && task.due_date) task.due_date = parseDue(task.due_date, task.due_all_day);
+    task.due_all_day = nextAllDay;
+    task.due_date = nextDue;
+    task.start_date = nextStart;
     task.updated_at = new Date();
 
     await writeTask(task);
