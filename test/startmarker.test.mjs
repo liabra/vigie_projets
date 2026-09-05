@@ -72,6 +72,10 @@ console.log("── Création avec un début");
   eq("l'événement d'échéance, lui, en porte un",
      calls.find((c) => c.op === "insert" && !c.repere).marker, json.task.id);
   eq("l'échéance reste parfaitement synchronisée", json.task.syncStatus, "synced");
+  // La paire se lit d'un coup d'œil dans l'agenda.
+  eq("les deux événements forment une paire lisible",
+     [calls.find((c) => c.op === "insert" && !c.repere).summary, r[0].summary],
+     ["Fin : Dossier", "Début : Dossier"]);
 }
 
 console.log("\n── Sans début : rien de plus qu'avant");

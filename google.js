@@ -222,7 +222,11 @@ const nextDay = (d) => {
 export function buildEventBody(task) {
   const done = task.status === "fait";
   const body = {
-    summary: (done ? "✓ " : "") + task.title,
+    // « Fin : » seulement quand la tâche a un jour de début, pour faire la
+    // paire avec le repère « Début : ». Sans début, un seul événement dans
+    // l'agenda : le préfixer n'apprendrait rien et alourdirait la lecture.
+    // Le ✓ reste devant : c'est un glyphe d'état, pas une partie du nom.
+    summary: (done ? "✓ " : "") + (task.start_date ? "Fin : " : "") + task.title,
     description: "Tâche Vigie · " + task.category,
   };
   if (done) body.colorId = GRAPHITE;

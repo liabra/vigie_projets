@@ -75,6 +75,27 @@ eq("journée entière", [buildEventBody(task()).start, buildEventBody(task()).en
 }
 eq("urgence jamais envoyée à Google", JSON.stringify(buildEventBody(task({ urgency: "urgente" }))).includes("urgen"), false);
 
+console.log("\n── « Fin : » seulement quand il y a un début");
+eq("sans début → titre nu, comme avant", buildEventBody(task()).summary, "Ma tâche");
+eq("avec un début → préfixé", buildEventBody(task({ start_date: "2026-09-12" })).summary, "Fin : Ma tâche");
+eq("faite et sans début → ✓ seul",
+   buildEventBody(task({ status: "fait" })).summary, "✓ Ma tâche");
+eq("faite et avec un début → ✓ puis Fin",
+   buildEventBody(task({ status: "fait", start_date: "2026-09-12" })).summary, "✓ Fin : Ma tâche");
+eq("début retiré → le préfixe disparaît au prochain update",
+   buildEventBody(task({ start_date: null })).summary, "Ma tâche");
+eq("un article n'est jamais préfixé", buildArticleEventBody(art()).summary, "Mon article");
+{
+  // Le préfixe suit la tâche : un update le pose ou le retire sans qu'on
+  // ait rien à resynchroniser à la main.
+  reset();
+  await G().syncTask(task({ start_date: "2026-09-12", calendar_event_id: "e1", calendar_id: VIGIE }));
+  eq("update d'une tâche avec début → titre préfixé", calls[0].summary, "Fin : Ma tâche");
+  reset();
+  await G().syncTask(task({ calendar_event_id: "e1", calendar_id: VIGIE }));
+  eq("update après retrait du début → titre nu", calls[0].summary, "Ma tâche");
+}
+
 console.log("\n── Articles");
 reset();
 {
