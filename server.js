@@ -943,7 +943,11 @@ app.get("/oauth/callback", async (req, res) => {
     // e.gcalOp est posé par google.js : il nomme l'appel Calendar fautif
     // (calendars.insert, events.update…) plutôt qu'un « 403 » anonyme.
     const where = e.gcalOp ? "appel " + e.gcalOp : "échange du code OAuth";
-    console.error("OAuth Google — échec sur " + where + ":", e);
+    // Le MESSAGE seulement, jamais l'objet : une erreur gaxios porte
+    // e.config.data, c'est-à-dire le corps de la requête de jeton —
+    // client_secret et code d'autorisation compris. Les journaux Railway
+    // sont conservés : ces valeurs n'ont rien à y faire.
+    console.error("OAuth Google — échec sur " + where + " : " + (e.message || "erreur inconnue"));
     res.status(500).send(
       "Connexion Google échouée pendant : " + where + "\n\n" + e.message +
         (e.code === 403
