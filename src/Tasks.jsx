@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { theme, authHeaders, canExecuteReconcile } from "./shared.js";
+import { dayOf, localInput, humanDate, humanRange, isLate, startProblem } from "./dates.js";
 import Stat, { statsRow } from "./Stat.jsx";
 import { Chip, FilterRow, sharedStyles } from "./ui.jsx";
 
@@ -67,27 +68,6 @@ async function api(path, opts = {}) {
   return d;
 }
 
-// ── Dates ─────────────────────────────────────────────────────
-// Une journée entière est stockée à minuit UTC : on la lit donc en
-// UTC, sinon le fuseau la ferait glisser d'un jour.
-export const dayOf = (iso) => (iso || "").slice(0, 10);
-export const localInput = (iso) => {
-  const d = new Date(iso);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
-};
-export function humanDate(task) {
-  if (!task.dueDate) return "";
-  const d = new Date(task.dueDate);
-  if (task.dueAllDay) {
-    return d.toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
-  }
-  return d.toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-}
-// Aujourd'hui en UTC, pour comparer aux échéances « journée entière ».
-const todayUtc = () => new Date().toISOString().slice(0, 10);
-export const isLate = (task) => task.status !== "fait" && task.dueDate && dayOf(task.dueDate) < todayUtc();
-
 export default function Tasks({ onLocked }) {
   const [tasks, setTasks] = useState(null);
   const [msg, setMsg] = useState("");
@@ -152,7 +132,10 @@ export default function Tasks({ onLocked }) {
     } catch (e) {
       if (fail(e)) return;
       apply(before);
-      setMsg("Serveur injoignable — modification annulée.");
+      // Un refus du serveur (400 : début après échéance, par exemple) porte
+      // un message qui dit quoi corriger. Le remplacer par « injoignable »
+      // ferait croire à une panne réseau.
+      setMsg(e.message && e.message !== "Erreur" ? e.message : "Serveur injoignable — modification annulée.");
     }
   };
 
@@ -473,7 +456,7 @@ export default function Tasks({ onLocked }) {
                   </div>
                   {t.dueDate && (
                     <div style={{ ...S.due, color: isLate(t) ? theme.red : theme.mute }}>
-                      {isLate(t) ? "⚠ " : ""}{humanDate(t)}
+                      {isLate(t) ? "⚠ " : ""}{humanRange(t)}
                       {t.calendarEventId ? (t.calendarId === "primary" ? " · agenda perso" : " · agenda Vigie") : ""}
                     </div>
                   )}
@@ -508,9 +491,14 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
   const [due, setDue] = useState(
     !task.dueDate ? "" : task.dueAllDay !== false ? dayOf(task.dueDate) : localInput(task.dueDate)
   );
+  const [start, setStart] = useState(task.startDate || "");
+
+  // L'échéance ramenée au jour, pour comparer au début qui, lui, est un jour.
+  const dueDay = due ? due.slice(0, 10) : "";
+  const souci = startProblem(start, dueDay);
 
   const save = () => {
-    if (!title.trim()) return;
+    if (!title.trim() || souci) return;
     onSave({
       title: title.trim(),
       category,
@@ -518,6 +506,7 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
       urgency,
       dueAllDay: allDay,
       dueDate: due ? (allDay ? due : new Date(due).toISOString()) : null,
+      startDate: start || null,
     });
   };
 
@@ -568,11 +557,30 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
             </label>
           </div>
         </div>
+        <div style={{ marginTop: 12 }}>
+          <label style={S.label}>Début (facultatif — pour une tâche qui s’étale)</label>
+          <input
+            className="at-focus"
+            style={{ ...S.field, borderColor: souci ? theme.red : theme.line }}
+            type="date"
+            value={start}
+            max={dueDay || undefined}
+            onChange={(e) => setStart(e.target.value)}
+          />
+          {souci && <div style={S.startError}>{souci}</div>}
+        </div>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: 20, gap: 10 }}>
           <button className="at-btn at-focus" style={{ ...S.ghost, color: "#B23B15", borderColor: "#F0C6B7" }} onClick={onDelete}>Supprimer</button>
           <div style={{ display: "flex", gap: 10 }}>
             <button className="at-btn at-focus" style={S.ghost} onClick={onCancel}>Annuler</button>
-            <button className="at-btn at-focus" style={{ ...S.addBtn, opacity: title.trim() ? 1 : 0.5 }} onClick={save} disabled={!title.trim()}>Enregistrer</button>
+            <button
+              className="at-btn at-focus"
+              style={{ ...S.addBtn, opacity: title.trim() && !souci ? 1 : 0.5 }}
+              onClick={save}
+              disabled={!title.trim() || !!souci}
+            >
+              Enregistrer
+            </button>
           </div>
         </div>
       </div>
@@ -611,5 +619,6 @@ const S = {
   gBtn: { fontFamily: "Inter", fontSize: 13, fontWeight: 600, padding: "7px 13px", borderRadius: 10, border: "none", background: theme.violetSoft, color: theme.violet, cursor: "pointer" },
   routeHint: { fontFamily: "Inter", fontSize: 11.5, color: theme.mute, marginTop: 7 },
   warnBar: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", background: theme.amberSoft, border: "1px solid #F0DCB0", borderRadius: 11, padding: "10px 13px", marginBottom: 14, fontFamily: "Inter", fontSize: 13, color: theme.ink },
+  startError: { fontFamily: "Inter", fontSize: 12, color: theme.red, marginTop: 6 },
   urgBadge: { fontFamily: "Inter", fontSize: 10.5, fontWeight: 700, letterSpacing: ".02em", padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0 },
 };
