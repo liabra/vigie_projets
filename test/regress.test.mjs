@@ -17,8 +17,8 @@ const eq = (l, got, want) => {
 google.calendar = () => ({
   calendars: { insert: async (a) => { created.push(a.requestBody.summary); return { data: { id: a.requestBody.summary.includes("Articles") ? ARTS : VIGIE } }; } },
   events: {
-    insert: async (a) => { calls.push({ op: "insert", cal: a.calendarId, summary: a.requestBody.summary, colorId: a.requestBody.colorId, start: a.requestBody.start, end: a.requestBody.end }); return { data: { id: "evt-" + ++seq } }; },
-    update: async (a) => { calls.push({ op: "update", cal: a.calendarId, id: a.eventId, summary: a.requestBody.summary, colorId: a.requestBody.colorId }); return { data: { id: a.eventId } }; },
+    insert: async (a) => { calls.push({ op: "insert", cal: a.calendarId, summary: a.requestBody.summary, colorId: a.requestBody.colorId, start: a.requestBody.start, end: a.requestBody.end, marker: a.requestBody.extendedProperties?.private?.vigieTaskId }); return { data: { id: "evt-" + ++seq } }; },
+    update: async (a) => { calls.push({ op: "update", cal: a.calendarId, id: a.eventId, summary: a.requestBody.summary, colorId: a.requestBody.colorId, marker: a.requestBody.extendedProperties?.private?.vigieTaskId }); return { data: { id: a.eventId } }; },
     delete: async (a) => { calls.push({ op: "delete", cal: a.calendarId, id: a.eventId }); return {}; },
     list: async () => { calls.push({ op: "list" }); return { data: { items: [] } }; },
   },
@@ -91,6 +91,28 @@ await G().syncArticle(art({ status: "en_ligne", calendar_event_id: "e1", calenda
 eq("en ligne → ✓ + gris", [calls[0].summary, calls[0].colorId], ["✓ Mon article", "8"]);
 eq("article all-day", [buildArticleEventBody(art()).start, buildArticleEventBody(art()).end], [{ date: "2026-09-15" }, { date: "2026-09-16" }]);
 eq("fin de mois → 1er octobre", buildArticleEventBody(art({ release_date: "2026-09-30T00:00:00.000Z" })).end, { date: "2026-10-01" });
+
+console.log("\n── Marqueur préservé par les updates");
+// Une tâche DÉJÀ synchronisée : chaque modification doit renvoyer le marqueur.
+const synced = { calendar_event_id: "evt-9", calendar_id: VIGIE };
+for (const [label, patch] of [
+  ["titre modifié",     { title: "Titre changé" }],
+  ["date modifiée",     { due_date: "2026-10-01T00:00:00.000Z" }],
+  ["passage à fait",    { status: "fait" }],
+  ["retour à faire",    { status: "a_faire" }],
+  ["journée → horaire", { due_all_day: false, due_date: "2026-09-15T14:00:00.000Z" }],
+  ["urgence modifiée",  { urgency: "urgente" }],
+]) {
+  reset();
+  await G().syncTask(task({ ...synced, ...patch }));
+  eq(`update après ${label} → marqueur présent`, calls[0].marker, "t-1");
+  eq(`update après ${label} → toujours un update, pas un insert`, calls[0].op, "update");
+}
+// Et la bascule d'agenda : l'événement est recréé, le marqueur doit suivre.
+reset();
+await G().syncTask(task({ ...synced, category: "perso" }));
+eq("après bascule d'agenda → marqueur sur le nouvel événement",
+   calls.find((c) => c.op === "insert").marker, "t-1");
 
 console.log("\n── Garde-fou");
 reset();
