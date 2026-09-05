@@ -53,6 +53,10 @@ const GRAPHITE = "8"; // colorId « Graphite » (gris) des événements
 // Nom d'appel Google → `operation` du journal, pour qu'un grep porte sur un
 // vocabulaire stable et non sur la formulation de l'appel.
 function operationOf(op) {
+  // Le repère de début d'abord : ses insert/update/delete se journalisent
+  // tous sous « start_marker », pour ne jamais se confondre avec le
+  // pipeline de due_date, autrement plus exigeant.
+  if (/repère de début/.test(op)) return "start_marker";
   if (/events\.insert/.test(op)) return "insert";
   if (/events\.update/.test(op)) return "update";
   if (/events\.delete/.test(op)) return "delete";
@@ -249,6 +253,20 @@ export function buildArticleEventBody(article) {
   if (online) body.colorId = GRAPHITE;
   if (article.id) body.extendedProperties = { private: { [MARKER_TASK]: String(article.id) } };
   return body;
+}
+
+// Repère de jour de début. Une journée entière, un titre qui dit ce que
+// c'est, et SURTOUT aucun extendedProperties : ce repère n'est pas marqué
+// et ne doit jamais l'être. C'est ce qui garantit que la recherche par
+// marqueur (findByMarker, donc reconcileCalendarSync) ne peut pas tomber
+// dessus et le confondre avec l'événement d'échéance.
+export function buildStartEventBody(task) {
+  return {
+    summary: "Début : " + task.title,
+    description: "Jour de début — Vigie",
+    start: { date: ymd(task.start_date) },
+    end: { date: nextDay(task.start_date) },
+  };
 }
 
 // Le marqueur porté par un corps d'événement, s'il en a un.
@@ -607,6 +625,49 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     return { eventId: created.data.id, calendarId: created.calendarId };
   }
 
+  // Cycle de vie du repère de début. Délibérément à l'écart de syncTask :
+  // il ne partage ni son marqueur, ni son état, ni sa réconciliation.
+  // AUCUNE recherche ici — le seul lien est start_event_id. Un double
+  // insert accidentel produirait donc un doublon que personne ne
+  // rattraperait : c'est le compromis assumé pour ce repère de confort.
+  // callCalendar est réutilisé pour la seule résilience réseau (rejeu sur
+  // « Premature close »), sans l'idempotence par marqueur.
+  async function syncStartMarker(task) {
+    const cal = await calendarApi();
+    if (!cal) return { eventId: task.start_event_id || null, skipped: true };
+    // Le même agenda que l'échéance de cette tâche : celui où elle vit
+    // déjà, sinon celui vers lequel sa catégorie l'enverrait.
+    const target = task.calendar_id || (await targetCalendar(task.category));
+    if (!target) return { eventId: task.start_event_id || null, skipped: true };
+
+    // Plus de jour de début → plus de repère.
+    if (!task.start_date) {
+      if (task.start_event_id) {
+        await removeEvent(task.start_event_id, target, task.id, "events.delete (repère de début)");
+      }
+      return { eventId: null };
+    }
+
+    const requestBody = buildStartEventBody(task);
+    if (task.start_event_id) {
+      try {
+        const r = await callCalendar("events.update (repère de début)", () =>
+          cal.events.update({ calendarId: target, eventId: task.start_event_id, requestBody }),
+          { taskId: task.id, calendarId: target, eventId: task.start_event_id, benign: isGone }
+        );
+        return { eventId: r.data.id, calendarId: target };
+      } catch (e) {
+        if (!isGone(e)) throw e;
+        // Repère effacé à la main côté Google : on le recrée.
+      }
+    }
+    const created = await callCalendar("events.insert (repère de début)", () =>
+      cal.events.insert({ calendarId: target, requestBody }),
+      { taskId: task.id, calendarId: target }
+    );
+    return { eventId: created.data.id, calendarId: target };
+  }
+
   // Création d'un événement, toujours dans l'agenda de l'app. Si Google
   // répond que l'agenda n'existe plus, on en recrée un et on réessaie
   // une fois — sans jamais aller chercher ailleurs dans le compte.
@@ -681,7 +742,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     }
   }
 
-  async function removeEvent(eventId, calendarId, taskId) {
+  async function removeEvent(eventId, calendarId, taskId, op = "events.delete") {
     if (!eventId) return;
     const cal = await calendarApi();
     if (!cal) return;
@@ -692,9 +753,9 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     const id = calendarId || (await knownCalendarId());
     if (!id) return;
     try {
-      await callCalendar("events.delete", () => cal.events.delete({ calendarId: id, eventId }),
+      await callCalendar(op, () => cal.events.delete({ calendarId: id, eventId }),
         { taskId, calendarId: id, eventId, benign: isGone });
-      logSync({ taskId, calendarId: id, eventId, operation: "delete", status: "success" });
+      logSync({ taskId, calendarId: id, eventId, operation: operationOf(op), status: "success" });
     } catch (e) {
       if (!isGone(e)) throw e;
       // Déjà parti : rawCall l'a déjà journalisé en « skipped ». C'est le
@@ -705,7 +766,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
   return {
     configured, consentUrl, handleCallback, status, disconnect,
     ensureCalendar, ensureArticlesCalendar, syncTask, syncArticle, removeEvent, isScopeError,
-    findByMarker, calendarApi, targetCalendar, targetCalendarForRead,
+    findByMarker, calendarApi, targetCalendar, targetCalendarForRead, syncStartMarker,
     SCOPES, CALENDAR_NAME, ARTICLES_CALENDAR_NAME, PRIMARY,
   };
 }

@@ -330,6 +330,37 @@ export const __testHooks =
         setSetting: (k, v) => { memSettings.set(k, v); },
       };
 
+// ── Repère de jour de début (best-effort) ─────────────────────
+// Volontairement à côté de syncTask, jamais dedans. Ce repère est un
+// confort d'affichage : il n'a ni marqueur vigieTaskId, ni sync_status, ni
+// réconciliation. Un échec est journalisé puis oublié — une tâche ne doit
+// JAMAIS passer en sync_status='error' à cause de lui.
+async function syncStartMarker(task) {
+  // Retenu avant l'appel : c'est ce qui décide du rattrapage en cas d'échec.
+  const retrait = !task.start_date;
+  try {
+    const { eventId, skipped } = await gcal.syncStartMarker(task);
+    if (skipped) return;
+    if ((eventId || null) !== (task.start_event_id || null)) {
+      task.start_event_id = eventId || null;
+      await writeTask(task);
+    }
+  } catch (e) {
+    logSync({ taskId: task.id, operation: "start_marker", status: "error", error: e.message });
+    // Un retrait doit effacer l'id MÊME si la suppression a échoué :
+    // conserver un identifiant mort le rendrait impossible à nettoyer
+    // ensuite, puisque rien ne repassera jamais dessus.
+    if (retrait && task.start_event_id) {
+      task.start_event_id = null;
+      try {
+        await writeTask(task);
+      } catch (w) {
+        logSync({ taskId: task.id, operation: "start_marker", status: "error", error: "persistance : " + w.message });
+      }
+    }
+  }
+}
+
 // ── Réconciliation ────────────────────────────────────────────
 // Rattrape les tâches dont le miroir agenda manque : événement jamais créé,
 // ou créé mais dont Vigie a perdu l'identifiant.
@@ -868,6 +899,9 @@ app.post("/api/tasks", auth, async (req, res) => {
   try {
     await insertTask(task);
     const syncWarning = await syncTask(task);
+    // Après syncTask : c'est lui qui fixe calendar_id, dont le repère a
+    // besoin pour viser le même agenda que l'échéance.
+    await syncStartMarker(task);
     res.status(201).json({ task: taskToJson(task), syncWarning });
   } catch (e) {
     logSync({ taskId: task.id, operation: "persist", status: "error", error: e.message });
@@ -925,6 +959,7 @@ app.patch("/api/tasks/:id", auth, async (req, res) => {
 
     await writeTask(task);
     const syncWarning = await syncTask(task);
+    await syncStartMarker(task);
     res.json({ task: taskToJson(task), syncWarning });
   } catch (e) {
     logSync({ taskId: req.params.id, operation: "persist", status: "error", error: e.message });
@@ -940,6 +975,14 @@ app.delete("/api/tasks/:id", auth, async (req, res) => {
     let syncWarning = null;
     try {
       await gcal.removeEvent(task.calendar_event_id, task.calendar_id, task.id);
+      // Le repère de début part avec, sans faire échouer quoi que ce soit.
+      if (task.start_event_id) {
+        try {
+          await gcal.removeEvent(task.start_event_id, task.calendar_id, task.id, "events.delete (repère de début)");
+        } catch (m) {
+          logSync({ taskId: task.id, operation: "start_marker", status: "error", error: m.message });
+        }
+      }
     } catch (e) {
       logSync({
         taskId: task.id, calendarId: task.calendar_id, eventId: task.calendar_event_id,
