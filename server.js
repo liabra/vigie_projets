@@ -3,7 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
 import { randomUUID } from "crypto";
-import { createGoogle } from "./google.js";
+import { createGoogle, MARKER_TASK } from "./google.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -256,6 +256,156 @@ function parseDue(value, allDay) {
   const d = new Date(value);
   if (isNaN(d.getTime())) return null;
   return allDay ? new Date(d.toISOString().slice(0, 10) + "T00:00:00.000Z") : d;
+}
+
+// Points d'injection RÉSERVÉS AUX TESTS : ils remplissent le stockage en
+// mémoire (celui du mode sans DATABASE_URL) pour éprouver la réconciliation
+// sans base ni réseau.
+//
+// Ils ne sont atteignables QUE par un import du module : aucune route ne les
+// référence, et rien ne fait de dispatch dynamique sur les exports. Avec une
+// base, ils sont de toute façon inertes — tous les lecteurs passent par
+// `if (!pool)` avant de regarder la mémoire. Le garde ci-dessous couvre le
+// dernier cas : un déploiement SANS DATABASE_URL, où la mémoire est le vrai
+// stockage. En production, l'export vaut null.
+export const __testHooks =
+  process.env.NODE_ENV === "production"
+    ? null
+    : {
+        setTasks: (t) => { memTasks = t; },
+        tasks: () => memTasks,
+        setAuth: (a) => { memAuth = a; },
+        setSetting: (k, v) => { memSettings.set(k, v); },
+      };
+
+// ── Réconciliation ────────────────────────────────────────────
+// Rattrape les tâches dont le miroir agenda manque : événement jamais créé,
+// ou créé mais dont Vigie a perdu l'identifiant.
+//
+// DEUX MODES. Le dry-run est le défaut et n'écrit RIEN — ni sur Google, ni
+// en base. Le mode réel exige execute: true, explicitement.
+//
+// LIMITE CONNUE, volontairement non corrigée ici. La recherche se fait par
+// le marqueur vigieTaskId. Un événement créé AVANT l'introduction du
+// marqueur (étape 1) n'en porte pas : il est donc INVISIBLE à cette
+// fonction, qui proposera « insert » — et créerait un doublon si on
+// l'exécutait sans regarder. C'est exactement le cas rencontré sur
+// « Travailler mon linkedin », rattrapé à la main. D'où le dry-run : sa
+// liste est faite pour être comparée à l'agenda réel, à l'œil, AVANT de
+// confirmer. Aucune détection par titre ou par date n'est tentée — trop de
+// faux positifs, et un faux positif ici écrase un vrai événement.
+const RECONCILE_BATCH = 25;
+
+// Une tâche est candidate si elle doit être miroir et que son état laisse
+// penser que le miroir manque.
+function needsReconcile(task) {
+  return shouldMirror(task) && (["pending", "error"].includes(task.sync_status) || !task.calendar_event_id);
+}
+
+// Ce que Vigie ferait pour cette tâche, décidé par une seule lecture filtrée
+// par marqueur. Aucune écriture, dans les deux modes.
+async function planForTask(cal, task) {
+  const target = await gcal.targetCalendarForRead(task.category);
+  // Agenda de l'app pas encore créé : rien à y trouver.
+  const found = target
+    ? await gcal.findByMarker(cal, target, { key: MARKER_TASK, value: String(task.id) })
+    : null;
+  if (found && found.id === task.calendar_event_id) return { action: "skip", target, found };
+  if (found) return { action: "adopt", target, found };
+  return { action: "insert", target, found: null };
+}
+
+// Verrou de concurrence. Deux passes simultanées liraient la même liste de
+// candidats, ne trouveraient rien par marqueur — l'insert de l'une n'étant
+// pas encore visible pour l'autre — et insèreraient chacune son événement.
+// C'est le seul chemin par lequel un doublon peut encore apparaître, et
+// l'idempotence de l'étape 1 ne le couvre pas : elle ne consulte le marqueur
+// qu'en cas de rejeu. Le verrou est ici, pas dans la route, pour protéger
+// TOUT appelant. Un seul processus, un seul utilisateur : un booléen suffit.
+let reconcileRunning = false;
+
+export async function reconcileCalendarSync(opts = {}) {
+  if (reconcileRunning) {
+    return {
+      busy: true,
+      executed: false,
+      checked: 0,
+      details: [],
+      note: "Une vérification de la synchro est déjà en cours.",
+    };
+  }
+  reconcileRunning = true;
+  try {
+    return await runReconcile(opts);
+  } finally {
+    // Toujours relâché, y compris si runReconcile lève.
+    reconcileRunning = false;
+  }
+}
+
+async function runReconcile({ execute = false, limit = RECONCILE_BATCH } = {}) {
+  const candidates = (await listTasks()).filter(needsReconcile).slice(0, limit);
+  const details = [];
+
+  const cal = await gcal.calendarApi();
+  // Pas de compte Google lié : rien à réconcilier, et rien à écrire.
+  if (!cal) {
+    const empty = { checked: 0, details: [], note: "Agenda Google non lié — rien à réconcilier." };
+    return execute
+      ? { ...empty, executed: true, adopted: 0, inserted: 0, stillFailing: 0 }
+      : { ...empty, executed: false, wouldAdopt: 0, wouldInsert: 0, wouldSkip: 0 };
+  }
+
+  for (const task of candidates) {
+    const entry = { id: task.id, title: task.title, category: task.category, action: null };
+    try {
+      const { action, target, found } = await planForTask(cal, task);
+      entry.action = action;
+      entry.calendarId = target;
+      if (found) entry.eventId = found.id;
+
+      if (!execute || action === "skip") { details.push(entry); continue; }
+
+      // Adoption : on inscrit le couple retrouvé AVANT de resynchroniser.
+      // Sans ça, syncTask irait insérer — son chemin nominal ne consulte le
+      // marqueur qu'en cas de rejeu — et créerait le doublon qu'on évite.
+      if (action === "adopt") {
+        task.calendar_event_id = found.id;
+        task.calendar_id = target;
+      }
+      // Puis le chemin normal : il met l'événement en accord avec la tâche,
+      // applique applySyncOutcome et persiste. Même code que /api/tasks.
+      const warning = await syncTask(task);
+      entry.result = task.sync_status;
+      if (warning) entry.warning = warning;
+    } catch (e) {
+      console.error(`Réconciliation ${task.id} → ${e.message}`);
+      entry.action = entry.action || "error";
+      entry.result = "error";
+      entry.error = (e.message || "Échec inconnu").slice(0, 500);
+    }
+    details.push(entry);
+  }
+
+  const count = (a) => details.filter((d) => d.action === a).length;
+  if (!execute) {
+    return {
+      executed: false,
+      checked: details.length,
+      wouldAdopt: count("adopt"),
+      wouldInsert: count("insert"),
+      wouldSkip: count("skip"),
+      details,
+    };
+  }
+  return {
+    executed: true,
+    checked: details.length,
+    adopted: details.filter((d) => d.action === "adopt" && d.result === "synced").length,
+    inserted: details.filter((d) => d.action === "insert" && d.result === "synced").length,
+    stillFailing: details.filter((d) => d.action !== "skip" && d.result !== "synced").length,
+    details,
+  };
 }
 
 // ── Articles ──────────────────────────────────────────────────
@@ -724,6 +874,24 @@ app.post("/api/google/disconnect", auth, async (_req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Déconnexion impossible." });
+  }
+});
+
+// Réconciliation. DRY-RUN PAR DÉFAUT : un appel sans corps, ou avec
+// n'importe quoi d'autre, ne fait qu'inspecter. Le mode réel exige
+// execute === true, le booléen — pas la chaîne "true", pas 1, pas "false"
+// (qui est pourtant truthy). Toute autre valeur retombe en dry-run.
+app.post("/api/calendar/reconcile", auth, async (req, res) => {
+  const execute = req.body?.execute === true;
+  try {
+    const summary = await reconcileCalendarSync({ execute });
+    // 409 : une passe tourne déjà. Surtout pas 200 — le client croirait
+    // que sa demande a été traitée et que rien n'était à faire.
+    if (summary.busy) return res.status(409).json(summary);
+    res.json(summary);
+  } catch (e) {
+    console.error("Réconciliation:", e);
+    res.status(500).json({ error: "Réconciliation impossible : " + (e.message || "erreur inconnue") });
   }
 });
 

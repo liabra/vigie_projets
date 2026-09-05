@@ -480,6 +480,16 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     return PRIMARY;
   }
 
+  // Même routage, mais SANS jamais rien créer : le dry-run de la
+  // réconciliation ne doit écrire ni sur Google ni en base, or
+  // ensureCalendar() crée l'agenda s'il manque. Renvoie null quand l'agenda
+  // de l'app n'existe pas encore — il n'y a alors aucun événement à y
+  // trouver, ce que l'appelant traduit par « il faudrait insérer ».
+  async function targetCalendarForRead(category) {
+    if (OWN_CALENDAR_CATEGORIES.includes(category)) return await knownCalendarId();
+    return PRIMARY;
+  }
+
   // Où vit l'événement DÉJÀ créé pour cette tâche. Les tâches d'avant le
   // routage n'ont pas de calendar_id : elles sont dans l'agenda « Vigie ».
   // On ne devine jamais vers primary — au pire on ne trouve rien.
@@ -654,7 +664,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
   return {
     configured, consentUrl, handleCallback, status, disconnect,
     ensureCalendar, ensureArticlesCalendar, syncTask, syncArticle, removeEvent, isScopeError,
-    findByMarker, calendarApi, targetCalendar,
+    findByMarker, calendarApi, targetCalendar, targetCalendarForRead,
     SCOPES, CALENDAR_NAME, ARTICLES_CALENDAR_NAME, PRIMARY,
   };
 }
