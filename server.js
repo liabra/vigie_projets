@@ -245,6 +245,12 @@ const taskToJson = (t) => ({
   urgency: t.urgency || "normale",
   calendarEventId: t.calendar_event_id || null,
   calendarId: t.calendar_id || null,
+  // État de la synchro agenda, en lecture seule : le client l'affiche
+  // (badge, message d'échec) mais ne le renvoie jamais — c'est la synchro
+  // qui l'écrit, pas l'utilisateur. PATCH /api/tasks ignore ces champs.
+  syncStatus: t.sync_status || "pending",
+  syncError: t.sync_error || null,
+  lastSyncAttempt: t.last_sync_attempt ? new Date(t.last_sync_attempt).toISOString() : null,
   createdAt: t.created_at ? new Date(t.created_at).toISOString() : null,
   updatedAt: t.updated_at ? new Date(t.updated_at).toISOString() : null,
 });

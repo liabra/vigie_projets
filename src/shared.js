@@ -36,3 +36,15 @@ const APPKEY_KEY = "vigie:key";
 export const getKey = () => { try { return localStorage.getItem(APPKEY_KEY) || ""; } catch { return ""; } };
 export const setKey = (k) => { try { localStorage.setItem(APPKEY_KEY, k); } catch {} };
 export const authHeaders = () => { const k = getKey(); return k ? { "x-app-key": k } : {}; };
+
+// ── Réconciliation agenda ─────────────────────────────────────
+// L'exécution réelle exige d'être passé par l'aperçu : `plan` n'est
+// renseigné qu'au retour d'un dry-run. Isolé ici plutôt qu'en ligne dans le
+// JSX pour que la règle soit vérifiable par un test, et pour qu'affichage du
+// bouton et garde de la fonction ne puissent pas diverger.
+export function canExecuteReconcile(plan, busy) {
+  if (busy) return false;          // une passe est déjà en cours
+  if (!plan) return false;         // aucun aperçu : rien à confirmer
+  if (plan.executed) return false; // ce n'est pas un aperçu, c'est un résultat
+  return plan.checked > 0;         // rien à corriger → rien à confirmer
+}

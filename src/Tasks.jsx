@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { theme, authHeaders } from "./shared.js";
+import { theme, authHeaders, canExecuteReconcile } from "./shared.js";
 import Stat, { statsRow } from "./Stat.jsx";
 import { Chip, FilterRow, sharedStyles } from "./ui.jsx";
 
@@ -91,6 +91,11 @@ export const isLate = (task) => task.status !== "fait" && task.dueDate && dayOf(
 export default function Tasks({ onLocked }) {
   const [tasks, setTasks] = useState(null);
   const [msg, setMsg] = useState("");
+  // Réconciliation. `plan` porte l'aperçu du dry-run ; tant qu'il est null,
+  // le bouton de confirmation n'existe pas — impossible d'exécuter en un clic.
+  const [plan, setPlan] = useState(null);
+  const [reconciling, setReconciling] = useState(false);
+  const [details, setDetails] = useState(false);
   const [statusFilter, setStatusFilter] = useState("tous");
   const [catFilter, setCatFilter] = useState("toutes");
   const [urgFilter, setUrgFilter] = useState("toutes");
@@ -215,6 +220,42 @@ export default function Tasks({ onLocked }) {
     } catch (e) { if (!fail(e)) setMsg("Déconnexion impossible."); }
   };
 
+  // Aperçu : n'écrit rien, ni en base ni sur Google (dry-run côté serveur).
+  const preview = async () => {
+    if (reconciling) return;
+    setReconciling(true); setMsg(""); setDetails(false);
+    try {
+      const d = await api("/api/calendar/reconcile", { method: "POST", body: JSON.stringify({}) });
+      setPlan(d);
+      if (d.note) setMsg(d.note);
+    } catch (e) {
+      if (!fail(e)) { setPlan(null); setMsg(e.message || "Vérification impossible."); }
+    } finally { setReconciling(false); }
+  };
+
+  // Exécution réelle. Inatteignable sans un aperçu préalable : le bouton
+  // n'est rendu que si `plan` existe, et la garde ci-dessous le redit.
+  const applyPlan = async () => {
+    // Même règle que celle qui décide d'afficher le bouton : les deux ne
+    // peuvent pas diverger, et un appel direct ne contourne rien.
+    if (!canExecuteReconcile(plan, reconciling)) return;
+    setReconciling(true);
+    try {
+      const d = await api("/api/calendar/reconcile", { method: "POST", body: JSON.stringify({ execute: true }) });
+      setPlan(null); setDetails(false);
+      setMsg(
+        d.checked === 0 ? (d.note || "Rien à resynchroniser.")
+        : `Resynchro : ${d.adopted} adoptée(s), ${d.inserted} créée(s)` +
+          (d.stillFailing ? `, ${d.stillFailing} encore en échec.` : ".")
+      );
+      // La liste vient de changer côté serveur : on la relit.
+      const fresh = await api("/api/tasks");
+      setTasks(fresh.tasks || []); cache.save(fresh.tasks || []);
+    } catch (e) {
+      if (!fail(e)) setMsg(e.message || "Resynchronisation impossible.");
+    } finally { setReconciling(false); }
+  };
+
   const list = tasks || [];
   // Totaux sur TOUTES les tâches : la barre de stats ne bouge pas
   // quand on filtre, comme celle des projets.
@@ -222,6 +263,9 @@ export default function Tasks({ onLocked }) {
     const by = (s) => list.filter((t) => t.status === s).length;
     return { total: list.length, a_faire: by("a_faire"), en_cours: by("en_cours"), fait: by("fait") };
   }, [list]);
+
+  // Badge permanent : compté sur TOUTES les tâches, filtres inclus ou non.
+  const desyncCount = useMemo(() => list.filter((t) => t.syncStatus === "error").length, [list]);
 
   const filtered = useMemo(
     () =>
@@ -271,6 +315,66 @@ export default function Tasks({ onLocked }) {
         <Stat n={counts.en_cours} label="en cours" color={STATUSES.en_cours.color} />
         <Stat n={counts.fait} label="fait" color={STATUSES.fait.color} />
       </div>
+
+      {/* Synchro agenda : le badge est permanent, l'aperçu précède toujours
+          l'exécution. Rien de tout ça n'apparaît sans compte Google lié. */}
+      {google && google.connected && (
+        <div style={S.syncBar}>
+          {desyncCount > 0 ? (
+            <span style={S.syncBadge} title="Ces tâches n’ont pas pu être écrites dans l’agenda.">
+              ⚠ {desyncCount} désynchronisée{desyncCount > 1 ? "s" : ""}
+            </span>
+          ) : (
+            <span style={S.syncOk}>Agenda à jour</span>
+          )}
+          <button className="at-btn at-focus" style={S.syncBtn} onClick={preview} disabled={reconciling}>
+            {reconciling ? "…" : "Vérifier la synchro agenda"}
+          </button>
+          {plan && (
+            <>
+              <span style={S.syncPlan}>
+                {plan.checked === 0
+                  ? "Rien à corriger."
+                  : `${plan.wouldAdopt} à adopter · ${plan.wouldInsert} à créer · ${plan.wouldSkip} déjà bonne${plan.wouldSkip > 1 ? "s" : ""}`}
+              </span>
+              {canExecuteReconcile(plan, reconciling) && (
+                <button className="at-btn at-focus" style={S.syncGo} onClick={applyPlan}>
+                  Confirmer et resynchroniser
+                </button>
+              )}
+              <button className="at-btn at-focus" style={S.syncLink} onClick={() => setPlan(null)}>Annuler</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Détail par tâche : court, on l'affiche ; long, on le replie. */}
+      {plan && plan.checked > 0 && (
+        <div style={S.planBox}>
+          {(plan.details.length <= 5 || details) ? (
+            <ul style={S.planList}>
+              {plan.details.map((d) => (
+                <li key={d.id} style={S.planItem}>
+                  <span style={{ ...S.planAction, ...(S.planActionTone[d.action] || null) }}>{PLAN_LABEL[d.action] || d.action}</span>
+                  <span>{d.title}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <button className="at-btn at-focus" style={S.syncLink} onClick={() => setDetails(true)}>
+              Voir le détail des {plan.details.length} tâches
+            </button>
+          )}
+          {/* Le doublon est possible ici : on le dit, avant de confirmer. */}
+          {plan.wouldInsert > 0 && (
+            <p style={S.planWarn}>
+              À créer : vérifie dans ton agenda qu’aucun de ces événements n’existe déjà. Un
+              événement créé avant l’ajout du marqueur est invisible à cette vérification, et
+              serait recréé en double.
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Pas de <form> : un bouton et une touche Entrée suffisent. */}
       <div style={S.addRow}>
@@ -476,8 +580,29 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
   );
 }
 
+const PLAN_LABEL = { adopt: "à adopter", insert: "à créer", skip: "déjà bonne", error: "erreur" };
+
 const S = {
   ...sharedStyles,
+
+  syncBar: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 },
+  syncBadge: { fontFamily: "Inter", fontSize: 12.5, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: "#FBE9E9", color: theme.red, whiteSpace: "nowrap" },
+  syncOk: { fontFamily: "Inter", fontSize: 12.5, color: theme.mute },
+  syncBtn: { fontFamily: "Inter", fontSize: 13, fontWeight: 500, padding: "6px 12px", borderRadius: 10, border: "1px solid " + theme.line, background: theme.panel, color: theme.slate, cursor: "pointer" },
+  syncGo: { fontFamily: "Inter", fontSize: 13, fontWeight: 600, padding: "6px 13px", borderRadius: 10, border: "none", background: theme.violet, color: "#fff", cursor: "pointer" },
+  syncLink: { fontFamily: "Inter", fontSize: 12.5, padding: "5px 8px", borderRadius: 8, border: "none", background: "transparent", color: theme.mute, cursor: "pointer", textDecoration: "underline" },
+  syncPlan: { fontFamily: "Inter", fontSize: 12.5, color: theme.ink },
+  planBox: { background: theme.panel, border: "1px solid " + theme.line, borderRadius: 12, padding: "12px 14px", marginBottom: 14 },
+  planList: { listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 },
+  planItem: { display: "flex", alignItems: "center", gap: 9, fontFamily: "Inter", fontSize: 13, color: theme.ink },
+  planAction: { fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, padding: "2px 7px", borderRadius: 6, whiteSpace: "nowrap", flexShrink: 0 },
+  planActionTone: {
+    adopt: { background: theme.violetSoft, color: theme.violet },
+    insert: { background: theme.amberSoft, color: theme.amberDeep },
+    skip: { background: theme.doneGreySoft, color: theme.doneGrey },
+    error: { background: "#FBE9E9", color: theme.red },
+  },
+  planWarn: { fontFamily: "Inter", fontSize: 12, color: theme.amberDeep, margin: "10px 0 0", lineHeight: 1.5 },
 
   // Propre à l'onglet Tâches.
   gOk: { fontFamily: "Inter", fontSize: 12.5, color: theme.green, display: "inline-flex", alignItems: "center", gap: 8 },
