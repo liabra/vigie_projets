@@ -316,7 +316,11 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
       return await fn();
     } catch (e) {
       logCalendarError(op, e, attempt, attempts, transient);
-      if (attempt === attempts) {
+      // Nommer l'opération à CHAQUE échec, pas seulement quand le budget de
+      // rejeu est épuisé : une erreur définitive (400/403/404) sort dès la
+      // première tentative et doit porter son nom elle aussi. gcalOp sert de
+      // garde pour ne pas préfixer deux fois le même objet d'erreur.
+      if (!e.gcalOp) {
         e.gcalOp = op;
         e.message = `${op} : ${e?.errors?.[0]?.message || e.message || ""}`;
       }

@@ -47,7 +47,7 @@ if (process.env.DATABASE_URL) {
 }
 let memState = null; // repli en mémoire quand pas de base
 
-async function ensureTable() {
+export async function ensureTable() {
   if (!pool) return;
   await pool.query(
     "CREATE TABLE IF NOT EXISTS app_state (id text PRIMARY KEY, data jsonb NOT NULL DEFAULT '[]'::jsonb)"
@@ -62,6 +62,9 @@ async function ensureTable() {
     urgency text NOT NULL DEFAULT 'normale',
     calendar_event_id text,
     calendar_id text,
+    sync_status text NOT NULL DEFAULT 'pending',
+    sync_error text,
+    last_sync_attempt timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
   )`);
@@ -71,6 +74,37 @@ async function ensureTable() {
   // d'avant le routage : elles sont toutes dans l'agenda « Vigie », et
   // google.js sait le déduire.
   await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS calendar_id text");
+
+  // État de la synchro agenda, pour qu'une désync cesse de passer inaperçue.
+  //   'pending' — pas (encore) miroir, ou jamais tenté
+  //   'synced'  — événement confirmé par Google, event_id en base
+  //   'error'   — échec définitif, sync_error dit lequel
+  //
+  // NOTE: sync_status/sync_error/last_sync_attempt ne couvrent que `tasks`
+  // pour l'instant. `articles` a le même risque de désync (calendar_event_id
+  // /calendar_id propres) mais est volontairement laissé hors périmètre —
+  // décision du 2026-09-05, à reprendre plus tard. Les articles gardent le
+  // rejeu idempotent hérité de callCalendar/withRetry, mais n'auront ni
+  // colonne d'état, ni suivi d'erreur persistant, ni réconciliation dédiée
+  // tant que cette décision n'est pas revisitée.
+  const hadSyncStatus = await pool.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'sync_status'"
+  );
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sync_status text NOT NULL DEFAULT 'pending'");
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sync_error text");
+  await pool.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_sync_attempt timestamptz");
+  // Rattrapage UNE SEULE FOIS, à la création de la colonne : une tâche qui
+  // porte déjà un calendar_event_id tient cet id de Google, elle est donc
+  // bien synchronisée. La laisser à 'pending' ferait re-vérifier tout
+  // l'existant pour rien. Conditionné à l'absence préalable de la colonne
+  // pour ne jamais réécrire un 'pending' voulu au redémarrage suivant.
+  if (!hadSyncStatus.rowCount) {
+    const done = await pool.query(
+      "UPDATE tasks SET sync_status = 'synced' WHERE calendar_event_id IS NOT NULL AND sync_status = 'pending'"
+    );
+    if (done.rowCount) console.log(`Migration : ${done.rowCount} tâche(s) déjà synchronisée(s) marquée(s) 'synced'.`);
+  }
+
   // user_id : un seul 'owner' aujourd'hui, la clé est là pour plus tard.
   await pool.query(`CREATE TABLE IF NOT EXISTS google_auth (
     user_id text PRIMARY KEY,
@@ -176,9 +210,11 @@ async function getTask(id) {
 async function insertTask(t) {
   if (!pool) { memTasks.push(t); return t; }
   await pool.query(
-    `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, urgency, calendar_event_id, calendar_id, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id, t.created_at, t.updated_at]
+    `INSERT INTO tasks (id, title, category, status, due_date, due_all_day, urgency, calendar_event_id, calendar_id,
+       sync_status, sync_error, last_sync_attempt, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id,
+     t.sync_status || "pending", t.sync_error ?? null, t.last_sync_attempt ?? null, t.created_at, t.updated_at]
   );
   return t;
 }
@@ -186,8 +222,10 @@ async function writeTask(t) {
   if (!pool) { memTasks = memTasks.map((x) => (x.id === t.id ? t : x)); return t; }
   await pool.query(
     `UPDATE tasks SET title=$2, category=$3, status=$4, due_date=$5, due_all_day=$6,
-       urgency=$7, calendar_event_id=$8, calendar_id=$9, updated_at=$10 WHERE id=$1`,
-    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id, t.updated_at]
+       urgency=$7, calendar_event_id=$8, calendar_id=$9, updated_at=$10,
+       sync_status=$11, sync_error=$12, last_sync_attempt=$13 WHERE id=$1`,
+    [t.id, t.title, t.category, t.status, t.due_date, t.due_all_day, t.urgency, t.calendar_event_id, t.calendar_id, t.updated_at,
+     t.sync_status || "pending", t.sync_error ?? null, t.last_sync_attempt ?? null]
   );
   return t;
 }
@@ -296,21 +334,72 @@ const gcal = createGoogle({ loadAuth, saveAuth, getSetting, setSetting });
 // Pousse l'état d'une tâche vers l'agenda. Ne lève jamais : sans
 // compte Google lié — ou si Google répond mal — la tâche reste
 // enregistrée, et repartira à la prochaine modification.
+// « Doit être miroir » : la tâche a une échéance ET une catégorie qui mène
+// à un agenda (perso/admin → primary, dev/boulot → « Vigie »). Une tâche
+// hors de cette définition n'a rien à refléter : ce n'est pas un échec.
+const MIRRORED_CATEGORIES = CATEGORIES; // les 4 catégories mènent à un agenda
+export function shouldMirror(task) {
+  return !!task.due_date && MIRRORED_CATEGORIES.includes(task.category);
+}
+
+// Transition d'état après une tentative de synchro. Isolée et pure : elle
+// ne touche ni Google ni la base, ce qui la rend testable exhaustivement.
+//   outcome.skipped → aucune tentative n'a eu lieu, on ne consigne rien
+//   outcome.error   → échec définitif
+//   sinon           → succès, eventId fait foi
+export function applySyncOutcome(task, outcome, attemptedAt) {
+  if (outcome.skipped) return task;
+  task.last_sync_attempt = attemptedAt;
+
+  if (outcome.error) {
+    task.sync_error = syncErrorMessage(outcome.error);
+    // Hors périmètre : l'échec est consigné, mais l'état ne passe pas en
+    // 'error' — une tâche sans échéance n'a pas de miroir à rater.
+    task.sync_status = shouldMirror(task) ? "error" : "pending";
+    return task;
+  }
+
+  // On garde le couple (agenda, événement) : c'est le seul moyen de
+  // savoir plus tard où patcher ou supprimer.
+  task.calendar_event_id = outcome.eventId || null;
+  task.calendar_id = outcome.eventId ? outcome.calendarId || null : null;
+  // 'synced' EXIGE un event_id confirmé par Google. Sans lui — tâche sans
+  // échéance, événement supprimé — on retombe à 'pending', pas 'error' :
+  // il n'y a rien à refléter.
+  task.sync_status = task.calendar_event_id ? "synced" : "pending";
+  task.sync_error = null;
+  return task;
+}
+
+// Message d'erreur exploitable : jamais un « Error » nu. rawCall (google.js)
+// a déjà préfixé l'opération, on ajoute de quoi agir quand c'est possible.
+function syncErrorMessage(e) {
+  if (gcal.isScopeError(e)) {
+    return "Droits Google insuffisants — reconnecter l'agenda dans l'onglet Tâches. " + (e.message || "");
+  }
+  const detail = (e && e.message ? String(e.message) : "").trim();
+  return (detail || "Échec inconnu de la synchro agenda").slice(0, 500);
+}
+
 async function syncTask(task) {
+  const attemptedAt = new Date();
   try {
-    const { eventId, calendarId, skipped } = await gcal.syncTask(task);
-    if (skipped) return null;
-    // On garde le couple (agenda, événement) : c'est le seul moyen de
-    // savoir plus tard où patcher ou supprimer.
-    if ((eventId || null) !== (task.calendar_event_id || null) ||
-        (calendarId || null) !== (task.calendar_id || null)) {
-      task.calendar_event_id = eventId || null;
-      task.calendar_id = eventId ? calendarId || null : null;
-      await writeTask(task);
-    }
+    const outcome = await gcal.syncTask(task);
+    // Google pas configuré ou pas lié : aucune tentative n'a eu lieu, donc
+    // rien à consigner. L'état reste ce qu'il était.
+    if (outcome.skipped) return null;
+    applySyncOutcome(task, outcome, attemptedAt);
+    await writeTask(task);
     return null;
   } catch (e) {
-    console.error("Google Agenda:", e.message);
+    console.error(
+      `Synchro tâche ${task.id} (${task.category}, miroir=${shouldMirror(task)}) → échec définitif : ${e.message}`
+    );
+    applySyncOutcome(task, { error: e }, attemptedAt);
+    // L'écriture d'état ne doit jamais faire échouer la requête : la tâche
+    // elle-même est déjà enregistrée.
+    try { await writeTask(task); } catch (w) { console.error("Écriture de l'état de synchro:", w.message); }
+
     if (gcal.isScopeError(e)) {
       return "Tâche enregistrée. L'agenda Google demande de nouveaux droits : " +
         "clique « Reconnecter l'agenda Google » dans l'onglet Tâches.";
@@ -537,6 +626,9 @@ app.post("/api/tasks", auth, async (req, res) => {
     due_all_day: allDay,
     calendar_event_id: null,
     calendar_id: null,
+    sync_status: "pending",
+    sync_error: null,
+    last_sync_attempt: null,
     created_at: now,
     updated_at: now,
   };
