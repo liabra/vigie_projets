@@ -698,6 +698,7 @@ const dist = path.join(__dirname, "dist");
 app.use(express.static(dist));
 app.get("*", (_req, res) => res.sendFile(path.join(dist, "index.html")));
 
+console.log("Node", process.version);
 const port = process.env.PORT || 3000;
 ensureTable()
   .catch((e) => console.error("Init base:", e))

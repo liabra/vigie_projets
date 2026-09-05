@@ -8,12 +8,18 @@
 //  GARDE-FOU. Écrire dans primary impose le scope calendar.events, qui
 //  côté Google couvre les événements de TOUS les agendas. La limite est
 //  donc tenue par ce module, pas par Google :
-//    · toute écriture vise un couple (calendar_id, event_id) que Vigie a
-//      elle-même créé et stocké sur la tâche ;
-//    · aucune énumération (events.list, calendarList, calendars.list) ;
-//    · aucun événement sans id stocké n'est touché, jamais.
-//  Les seuls points d'écriture sont syncTask / insertEvent / removeEvent
-//  ci-dessous — trois fonctions, toutes tributaires d'un id stocké.
+//    · toute écriture vise soit un couple (calendar_id, event_id) que
+//      Vigie a elle-même créé et stocké, soit un événement portant SON
+//      marqueur privé vigieTaskId ;
+//    · la seule lecture d'agenda autorisée est events.list FILTRÉE par ce
+//      marqueur (findByMarker) — elle ne peut ramener que des événements
+//      créés par Vigie. Jamais de liste nue, jamais calendarList ni
+//      calendars.list ;
+//    · aucun événement sans id stocké ni marqueur n'est touché, jamais ;
+//    · une lecture ne remonte JAMAIS vers les tâches : elle sert seulement
+//      à retrouver un id d'événement perdu. Le sens reste unique.
+//  Les seuls points d'écriture sont syncTask / syncArticle / insertEvent /
+//  removeEvent ci-dessous.
 //
 //  Le module ne touche pas à la base directement : server.js lui
 //  passe un petit adaptateur de stockage (store).
@@ -26,9 +32,9 @@ import { google } from "googleapis";
 //                           (primary), que l'app ne possède pas.
 // calendar.events est large côté Google (il couvre les événements de tous
 // les agendas). C'est le code ci-dessous qui le borne : Vigie n'agit JAMAIS
-// que sur un couple (calendar_id, event_id) qu'elle a elle-même créé et
-// stocké. Aucune énumération, aucune écriture à l'aveugle — voir syncTask
-// et removeEvent, seuls points d'écriture du module.
+// que sur un événement qu'elle a elle-même créé — couple (calendar_id,
+// event_id) stocké, ou marqueur privé. Aucune liste nue, aucune écriture à
+// l'aveugle : voir le GARDE-FOU en tête de fichier.
 const SCOPES = [
   "https://www.googleapis.com/auth/calendar.app.created",
   "https://www.googleapis.com/auth/calendar.events",
@@ -56,6 +62,134 @@ export function isScopeError(e) {
   return code === 403 && /insufficient|scope/i.test(msg);
 }
 
+// ── Marqueur d'appartenance ───────────────────────────────────
+// Posé sur CHAQUE événement écrit par Vigie, dans les propriétés privées.
+// C'est le lien de secours : si (calendar_id, event_id) venait à manquer
+// en base, il permet de retrouver l'événement — et lui seul. Une recherche
+// filtrée par ce marqueur ne peut pas ramener un événement que Vigie n'a
+// pas créé : c'est ce qui la rend compatible avec le garde-fou.
+// Une seule clé pour les tâches ET les articles : les deux id sont des
+// uuid distincts, et une recherche est toujours bornée à UN agenda — un
+// article ne vit que dans « Vigie – Articles », jamais là où sont les tâches.
+export const MARKER_TASK = "vigieTaskId";
+
+// ── Résilience réseau ─────────────────────────────────────────
+// Node 22.23.0 et 24.17.0 ont introduit une régression qui fait échouer
+// node-fetch@2 (sous gaxios/googleapis) avec « Premature close » ALORS QUE
+// la requête a pu aboutir côté Google. C'est un faux négatif : rejouer un
+// insert à l'aveugle créerait un doublon. D'où deux mécanismes distincts —
+//   · withRetry ne rejoue QUE ce qui est transitoire ;
+//   · avant tout ré-insert, findByMarker vérifie si l'événement existe déjà.
+const MAX_ATTEMPTS = 3;
+const BASE_DELAY_MS = 300;
+const MAX_DELAY_MS = 2000; // pire cas : ~4 s de latence ajoutée, jamais plus
+
+// Codes système / réseau : la requête n'a pas abouti proprement, on rejoue.
+const TRANSIENT_CODES = new Set([
+  "ERR_STREAM_PREMATURE_CLOSE", "ECONNRESET", "ETIMEDOUT",
+  "EAI_AGAIN", "ENOTFOUND", "EPIPE",
+]);
+const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504]);
+// Jamais rejoués. La requête est mauvaise (400), le droit manque (403),
+// la cible n'existe plus (404) — et le 401 relève du rafraîchissement de
+// jeton, fait par la librairie OAuth dans authed(), pas d'un retry aveugle.
+const FATAL_STATUS = new Set([400, 401, 403, 404]);
+const PREMATURE = /premature close/i;
+
+// gaxios et node-fetch empilent les causes : la vraie raison est souvent
+// deux niveaux plus bas. On parcourt la chaîne, en se gardant des cycles.
+function* causeChain(e, max = 6) {
+  const seen = new Set();
+  let cur = e;
+  for (let i = 0; cur && i < max; i++) {
+    if (seen.has(cur)) return;
+    seen.add(cur);
+    yield cur;
+    cur = cur.cause;
+  }
+}
+
+// Statut HTTP, où qu'il se cache : gaxios le met dans response.status,
+// googleapis parfois dans code (nombre OU chaîne).
+export function httpStatusOf(e) {
+  for (const err of causeChain(e)) {
+    for (const v of [err.response?.status, err.status, err.code]) {
+      const n = typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v;
+      if (typeof n === "number" && n >= 100 && n < 600) return n;
+    }
+  }
+  return null;
+}
+function sysCodeOf(e) {
+  for (const err of causeChain(e)) {
+    if (typeof err.code === "string" && !/^\d+$/.test(err.code)) return err.code;
+  }
+  return null;
+}
+const messagesOf = (e) => [...causeChain(e)].map((x) => x?.message || "").join(" | ");
+
+export function isTransient(e) {
+  // Une erreur définitive le reste, quel que soit le reste du message.
+  const status = httpStatusOf(e);
+  if (status !== null && FATAL_STATUS.has(status)) return false;
+  // Le « Premature close » n'expose pas de statut HTTP exploitable : il
+  // faut le reconnaître au message, avant de regarder les statuts.
+  if (PREMATURE.test(messagesOf(e))) return true;
+  if (TRANSIENT_CODES.has(sysCodeOf(e))) return true;
+  return status !== null && TRANSIENT_STATUS.has(status);
+}
+
+// Retry-After (429 / 503) : en secondes ou en date HTTP. Plafonné, sinon
+// un « reviens dans 5 minutes » bloquerait la requête de l'utilisateur —
+// la réconciliation rattrapera plus tard.
+function retryAfterMs(e) {
+  for (const err of causeChain(e)) {
+    const h = err.response?.headers;
+    if (!h) continue;
+    const raw = typeof h.get === "function" ? h.get("retry-after") : h["retry-after"] ?? h["Retry-After"];
+    if (raw == null || raw === "") continue;
+    const secs = Number(raw);
+    if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+    const when = Date.parse(raw);
+    if (Number.isFinite(when)) return Math.max(0, when - Date.now());
+  }
+  return null;
+}
+
+// Exponentiel, moitié fixe / moitié aléatoire : borné, mais désynchronisé.
+export function retryDelayMs(attempt, e, random = Math.random) {
+  const after = retryAfterMs(e);
+  if (after !== null) return Math.min(after, MAX_DELAY_MS);
+  const exp = Math.min(BASE_DELAY_MS * 2 ** (attempt - 1), MAX_DELAY_MS);
+  return Math.round(exp / 2 + random() * (exp / 2));
+}
+
+const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Rejoue fn tant que l'erreur est transitoire. beforeAttempt permet de
+// court-circuiter une re-tentative (c'est là que l'insert va vérifier si
+// l'événement existe déjà) : toute valeur qu'il renvoie devient le résultat.
+export async function withRetry(fn, opts = {}) {
+  const { attempts = MAX_ATTEMPTS, sleep = realSleep, beforeAttempt, onAttemptError } = opts;
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (beforeAttempt && attempt > 1) {
+      const shortcut = await beforeAttempt(attempt, lastErr);
+      if (shortcut !== undefined) return shortcut;
+    }
+    try {
+      return await fn(attempt);
+    } catch (e) {
+      lastErr = e;
+      const transient = isTransient(e);
+      if (onAttemptError) onAttemptError(e, attempt, transient, attempts);
+      if (!transient || attempt === attempts) throw e;
+      await sleep(retryDelayMs(attempt, e));
+    }
+  }
+  throw lastErr;
+}
+
 // ── Forme de l'événement ──────────────────────────────────────
 // Les journées entières sont manipulées en UTC : la tâche est rangée
 // à minuit UTC, l'agenda reçoit le même jour quel que soit le fuseau.
@@ -76,6 +210,9 @@ export function buildEventBody(task) {
     description: "Tâche Vigie · " + task.category,
   };
   if (done) body.colorId = GRAPHITE;
+  // Réaffirmé à chaque écriture : events.update remplace le corps entier,
+  // donc reconstruire le marqueur depuis la tâche le préserve toujours.
+  if (task.id) body.extendedProperties = { private: { [MARKER_TASK]: String(task.id) } };
   if (task.due_all_day) {
     body.start = { date: ymd(task.due_date) };
     body.end = { date: nextDay(task.due_date) };
@@ -98,10 +235,18 @@ export function buildArticleEventBody(article) {
     end: { date: nextDay(article.release_date) },
   };
   if (online) body.colorId = GRAPHITE;
+  if (article.id) body.extendedProperties = { private: { [MARKER_TASK]: String(article.id) } };
   return body;
 }
 
-export function createGoogle(store) {
+// Le marqueur porté par un corps d'événement, s'il en a un.
+export function markerOf(requestBody) {
+  const value = requestBody?.extendedProperties?.private?.[MARKER_TASK];
+  return value ? { key: MARKER_TASK, value: String(value) } : null;
+}
+
+// `sleep` est injectable pour que les tests n'attendent pas réellement.
+export function createGoogle(store, { sleep = realSleep } = {}) {
   const CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
   const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
   const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "";
@@ -148,27 +293,74 @@ export function createGoogle(store) {
     return c;
   }
 
-  // Tout appel à l'API passe par ici : en cas d'échec, le log dit
-  // EXACTEMENT quelle opération a échoué, et l'erreur porte ce nom.
-  async function callCalendar(op, fn) {
+  // Un seul endroit pour dire ce qui a échoué, et à quelle tentative.
+  function logCalendarError(op, e, attempt, attempts, transient) {
+    const code = httpStatusOf(e) ?? e?.code ?? "erreur";
+    const detail = e?.errors?.[0]?.message || e?.message || "";
+    const tag = attempts > 1 ? ` [tentative ${attempt}/${attempts}${transient ? ", transitoire" : ""}]` : "";
+    if (code === 403) {
+      console.error(
+        `Google Agenda: ${op}${tag} → 403 (${detail}). Scopes demandés : ${SCOPES.join(", ")}. ` +
+          `Si le compte a été lié avant l'ajout de calendar.events, il faut repasser par ` +
+          `« Connecter l'agenda Google » pour redonner le consentement.`
+      );
+    } else {
+      console.error(`Google Agenda: ${op}${tag} → ${code} (${detail})`);
+    }
+  }
+
+  // Un appel, sans rejeu : journalise et nomme l'erreur. Sert de brique
+  // aux deux enveloppes ci-dessous.
+  async function rawCall(op, fn, attempt = 1, attempts = 1, transient = false) {
     try {
       return await fn();
     } catch (e) {
-      const code = e?.code || e?.status;
-      const detail = e?.errors?.[0]?.message || e?.message || "";
-      if (code === 403) {
-        console.error(
-          `Google Agenda: ${op} → 403 (${detail}). Scopes demandés : ${SCOPES.join(", ")}. ` +
-            `Si le compte a été lié avant l'ajout de calendar.events, il faut repasser par ` +
-            `« Connecter l'agenda Google » pour redonner le consentement.`
-        );
-      } else {
-        console.error(`Google Agenda: ${op} → ${code || "erreur"} (${detail})`);
+      logCalendarError(op, e, attempt, attempts, transient);
+      if (attempt === attempts) {
+        e.gcalOp = op;
+        e.message = `${op} : ${e?.errors?.[0]?.message || e.message || ""}`;
       }
-      e.gcalOp = op;
-      e.message = `${op} : ${detail || e.message}`;
       throw e;
     }
+  }
+
+  // Tout appel à l'API passe par ici : rejeu des erreurs transitoires
+  // inclus. Sûr pour update / delete / calendars.insert, qui sont
+  // naturellement idempotents. L'insert, lui, a son propre chemin
+  // (insertResilient) car le rejouer à l'aveugle créerait un doublon.
+  async function callCalendar(op, fn) {
+    return withRetry((attempt) => rawCall(op, fn, attempt, MAX_ATTEMPTS, true), {
+      sleep,
+      onAttemptError: (e, attempt, transient) => {
+        if (transient && attempt < MAX_ATTEMPTS) {
+          console.warn(`Google Agenda: ${op} → échec transitoire, nouvelle tentative (${attempt + 1}/${MAX_ATTEMPTS}).`);
+        }
+      },
+    });
+  }
+
+  // SEULE lecture d'agenda du module, et elle est toujours filtrée par le
+  // marqueur privé de Vigie : sans marqueur, elle ne cherche rien. Google
+  // ne peut donc renvoyer que des événements écrits par Vigie — et on le
+  // revérifie nous-mêmes, parce que le garde-fou est tenu par ce code.
+  // Elle ne modifie jamais rien dans Vigie : elle rend un id, c'est tout.
+  async function findByMarker(cal, calendarId, marker) {
+    if (!cal || !calendarId || !marker?.value) return null;
+    const r = await callCalendar("events.list (par marqueur)", () =>
+      cal.events.list({
+        calendarId,
+        privateExtendedProperty: `${marker.key}=${marker.value}`,
+        showDeleted: false,
+        singleEvents: true,
+        maxResults: 5,
+      })
+    );
+    const items = r?.data?.items || [];
+    return (
+      items.find(
+        (ev) => ev?.status !== "cancelled" && ev?.extendedProperties?.private?.[marker.key] === marker.value
+      ) || null
+    );
   }
 
   // 404 / 410 : l'objet visé (événement ou agenda) n'existe plus.
@@ -372,11 +564,60 @@ export function createGoogle(store) {
   // Création d'un événement, toujours dans l'agenda de l'app. Si Google
   // répond que l'agenda n'existe plus, on en recrée un et on réessaie
   // une fois — sans jamais aller chercher ailleurs dans le compte.
+  // Insert idempotent. Le chemin nominal reste UN appel : on insère, point.
+  // Ce n'est qu'en cas d'échec transitoire qu'on va vérifier, avant de
+  // rejouer, si l'insert précédent avait en fait abouti — c'est ce qui
+  // rend le « Premature close » inoffensif au lieu de créer un doublon.
+  async function insertResilient(cal, calendarId, requestBody, op = "events.insert") {
+    const marker = markerOf(requestBody);
+    // Une recherche qui échoue ne doit jamais masquer l'erreur d'insert.
+    const lookup = async () => {
+      try {
+        return await findByMarker(cal, calendarId, marker);
+      } catch (e) {
+        console.error(`Google Agenda: recherche par marqueur avant rejeu → ${e.message}`);
+        return null;
+      }
+    };
+    const adopt = (found) => {
+      console.warn(
+        `Google Agenda: ${op} rejoué, mais l'événement existait déjà (${found.id}) → adopté, aucun doublon créé.`
+      );
+      return { data: found, adopted: true };
+    };
+
+    try {
+      return await withRetry(
+        async (attempt) => ({
+          data: (await rawCall(op, () => cal.events.insert({ calendarId, requestBody }), attempt, MAX_ATTEMPTS, true)).data,
+          adopted: false,
+        }),
+        {
+          sleep,
+          // Avant CHAQUE re-tentative : l'insert précédent a-t-il abouti ?
+          beforeAttempt: async () => {
+            const found = marker ? await lookup() : null;
+            return found ? adopt(found) : undefined;
+          },
+        }
+      );
+    } catch (e) {
+      // La tentative finale aussi peut être un faux négatif : une dernière
+      // vérification avant d'abandonner. Sinon la réconciliation prendra
+      // le relais (elle adoptera l'événement, sans le dupliquer).
+      if (marker && isTransient(e)) {
+        const found = await lookup();
+        if (found) return adopt(found);
+      }
+      throw e;
+    }
+  }
+
   async function insertEvent(requestBody, calendarId, which = "tasks") {
     const cal = await calendarApi();
     try {
-      const r = await callCalendar("events.insert", () => cal.events.insert({ calendarId, requestBody }));
-      return { data: r.data, calendarId };
+      const r = await insertResilient(cal, calendarId, requestBody);
+      return { data: r.data, calendarId, adopted: r.adopted };
     } catch (e) {
       // Le repli « l'agenda a disparu, on le recrée » n'a de sens que pour
       // les agendas de l'app : primary, lui, ne disparaît pas.
@@ -384,10 +625,8 @@ export function createGoogle(store) {
       await forgetCalendar(which);
       const fresh = await ensureAppCalendar(which);
       if (!fresh) throw e;
-      const r = await callCalendar("events.insert (après recréation de l'agenda)", () =>
-        cal.events.insert({ calendarId: fresh, requestBody })
-      );
-      return { data: r.data, calendarId: fresh };
+      const r = await insertResilient(cal, fresh, requestBody, "events.insert (après recréation de l'agenda)");
+      return { data: r.data, calendarId: fresh, adopted: r.adopted };
     }
   }
 
@@ -411,6 +650,7 @@ export function createGoogle(store) {
   return {
     configured, consentUrl, handleCallback, status, disconnect,
     ensureCalendar, ensureArticlesCalendar, syncTask, syncArticle, removeEvent, isScopeError,
+    findByMarker, calendarApi, targetCalendar,
     SCOPES, CALENDAR_NAME, ARTICLES_CALENDAR_NAME, PRIMARY,
   };
 }

@@ -94,20 +94,38 @@ Google couvre les événements de **tous** tes agendas. C'est un vrai
 élargissement par rapport à `calendar.app.created` seul : la limite n'est
 plus posée par Google, elle est tenue par le code.
 
-La règle, dans [`google.js`](google.js) : **toute écriture vise un couple
-(`calendar_id`, `event_id`) que Vigie a elle-même créé et stocké sur la
-tâche.** Concrètement —
+La règle, dans [`google.js`](google.js) : **Vigie ne touche qu'un événement
+qu'elle a elle-même créé** — reconnu soit par le couple (`calendar_id`,
+`event_id`) stocké sur la tâche, soit par le marqueur privé qu'elle pose sur
+chacun de ses événements. Concrètement —
 
-- aucune énumération : ni `events.list`, ni `calendarList`, ni
-  `calendars.list`, nulle part dans le code ;
-- aucun événement sans id stocké n'est jamais lu, modifié ni supprimé ;
+- chaque événement écrit par Vigie porte
+  `extendedProperties.private.vigieTaskId` = l'id de la tâche (ou de
+  l'article). C'est son lien de secours si l'`event_id` venait à manquer en
+  base ;
+- aucun événement sans id stocké **ni** marqueur n'est jamais lu, modifié ni
+  supprimé ;
+- une seule lecture d'agenda existe dans tout le projet, `findByMarker`, et
+  elle est **toujours** filtrée par ce marqueur
+  (`privateExtendedProperty=vigieTaskId=…`) : sans marqueur elle ne cherche
+  rien. Google ne peut donc lui renvoyer que des événements créés par Vigie —
+  et le code le revérifie lui-même sur chaque résultat avant de l'adopter.
+  Jamais de liste nue, jamais `calendarList` ni `calendars.list` ;
+- cette lecture ne remonte **rien** vers Vigie : elle rend un identifiant
+  d'événement perdu, rien d'autre. Le sens unique tient ;
 - les seules opérations Calendar du projet sont `calendars.insert` (une fois
-  par agenda de l'app), `events.insert`, `events.update` et `events.delete` —
-  les deux dernières toujours sur un `eventId` stocké.
+  par agenda de l'app), `events.insert`, `events.update`, `events.delete` et
+  ce `events.list` filtré.
 
 Autrement dit, un événement de ton agenda principal que Vigie n'a pas créé
-lui est invisible en pratique : elle n'a aucun moyen d'en apprendre
-l'existence.
+lui est invisible en pratique : il ne porte pas son marqueur, et elle n'a
+aucun moyen d'en apprendre l'existence.
+
+> **Pourquoi cette lecture existe.** Une régression de Node (22.23.0,
+> 24.17.0) fait échouer certaines écritures avec « Premature close » *alors
+> que Google les a acceptées*. Rejouer l'insert à l'aveugle créerait un
+> doublon ; le marqueur permet de vérifier, avant de rejouer, si l'événement
+> existe déjà. Voir « Quand le réseau flanche » plus bas.
 
 Ce qui est synchronisé :
 
@@ -125,6 +143,25 @@ Ce qui est synchronisé :
 | catégorie changée d'un agenda à l'autre | ancien événement supprimé, recréé sur le bon agenda |
 
 Tout cela vaut à l'identique sur les deux destinations.
+
+### Quand le réseau flanche
+
+Une écriture d'agenda peut échouer pour une raison passagère : coupure
+réseau, 429/503 de Google, ou le fameux « Premature close ». Vigie rejoue
+alors l'opération jusqu'à 3 fois, avec une attente croissante (~0,3 s puis
+~0,6 s, plafonnée à 2 s).
+
+Ne sont rejouées que les erreurs **transitoires**. Un 400, 401, 403 ou 404
+est définitif : la requête est mauvaise, le droit manque, ou la cible
+n'existe plus — insister n'y changerait rien. Le 401 relève du
+rafraîchissement du jeton, pas d'un rejeu.
+
+Le cas délicat est le « Premature close » : la connexion se coupe avant la
+réponse, **mais Google a pu enregistrer l'événement quand même**. C'est un
+faux négatif. Avant chaque nouvel essai de création, Vigie cherche donc son
+marqueur : si l'événement existe déjà, elle adopte son identifiant au lieu
+d'en créer un second. Le chemin normal, lui, reste **un seul appel** — la
+vérification n'a lieu que sur le chemin de rattrapage.
 
 ### Mise en place (une fois)
 
