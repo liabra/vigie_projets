@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "vite build",
     "start": "node server.js",
-    "test": "node test/retry.test.mjs && node test/regress.test.mjs && node test/migration.test.mjs && node test/syncstate.test.mjs && node test/reconcile.test.mjs && node test/ui.test.mjs && node test/oauth-log.test.mjs"
+    "test": "node test/retry.test.mjs && node test/regress.test.mjs && node test/migration.test.mjs && node test/syncstate.test.mjs && node test/reconcile.test.mjs && node test/ui.test.mjs && node test/log.test.mjs && node test/oauth-log.test.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.2",

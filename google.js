@@ -25,6 +25,7 @@
 //  passe un petit adaptateur de stockage (store).
 // ─────────────────────────────────────────────────────────────
 import { google } from "googleapis";
+import { logSync } from "./log.js";
 
 // Deux scopes, deux destinations :
 //  - calendar.app.created : l'agenda « Vigie » que l'app crée et possède.
@@ -48,6 +49,17 @@ const APP_CALENDARS = {
   articles: { key: "google_articles_calendar_id", name: ARTICLES_CALENDAR_NAME, description: "Dates de sortie des articles Vigie." },
 };
 const GRAPHITE = "8"; // colorId « Graphite » (gris) des événements
+
+// Nom d'appel Google → `operation` du journal, pour qu'un grep porte sur un
+// vocabulaire stable et non sur la formulation de l'appel.
+function operationOf(op) {
+  if (/events\.insert/.test(op)) return "insert";
+  if (/events\.update/.test(op)) return "update";
+  if (/events\.delete/.test(op)) return "delete";
+  if (/events\.list/.test(op)) return "lookup";
+  if (/calendars\.insert/.test(op)) return "calendar_create";
+  return "call";
+}
 
 // Agenda principal de l'utilisateur : destination des tâches perso/admin.
 const PRIMARY = "primary";
@@ -288,41 +300,60 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
           access_token: t.access_token || row.access_token,
           expiry: t.expiry_date ? new Date(t.expiry_date) : null,
         })
-        .catch((e) => console.error("Google: sauvegarde du jeton:", e.message));
+        // Ni access_token ni refresh_token dans le journal : seulement
+        // qu'un rafraîchissement a eu lieu, et jusqu'à quand il vaut.
+        .then(() => logSync({
+          operation: "oauth_refresh", status: "success",
+          expiry: t.expiry_date ? new Date(t.expiry_date).toISOString() : undefined,
+        }))
+        .catch((e) => logSync({ operation: "oauth_refresh", status: "error", error: e.message }));
     });
     return c;
   }
 
-  // Un seul endroit pour dire ce qui a échoué, et à quelle tentative.
-  function logCalendarError(op, e, attempt, attempts, transient) {
-    const code = httpStatusOf(e) ?? e?.code ?? "erreur";
-    const detail = e?.errors?.[0]?.message || e?.message || "";
-    const tag = attempts > 1 ? ` [tentative ${attempt}/${attempts}${transient ? ", transitoire" : ""}]` : "";
-    if (code === 403) {
-      console.error(
-        `Google Agenda: ${op}${tag} → 403 (${detail}). Scopes demandés : ${SCOPES.join(", ")}. ` +
-          `Si le compte a été lié avant l'ajout de calendar.events, il faut repasser par ` +
-          `« Connecter l'agenda Google » pour redonner le consentement.`
-      );
-    } else {
-      console.error(`Google Agenda: ${op}${tag} → ${code} (${detail})`);
-    }
-  }
-
-  // Un appel, sans rejeu : journalise et nomme l'erreur. Sert de brique
-  // aux deux enveloppes ci-dessous.
-  async function rawCall(op, fn, attempt = 1, attempts = 1, transient = false) {
+  // Un appel, sans rejeu. Seul journaliseur des appels Calendar : succès de
+  // rattrapage, rejeu et échec définitif passent tous par ici, avec le même
+  // contexte (ctx) que l'appelant lui a donné.
+  // `benign` laisse l'appelant déclarer qu'une erreur est ATTENDUE (un 404
+  // sur une suppression, par exemple). Elle est alors journalisée en
+  // « skipped » et non en « error » : sans ça, une condition parfaitement
+  // normale déclencherait une alerte, et le journal perdrait sa valeur.
+  // Le prédicat lui-même ne doit jamais atterrir dans la ligne de log.
+  async function rawCall(op, fn, ctx = {}, attempt = 1, attempts = 1) {
+    const { benign, ...logCtx } = ctx;
     try {
-      return await fn();
+      const r = await fn();
+      // Succès APRÈS un échec : c'est le signal qui manquait pour savoir si
+      // la panne réseau se produit encore et à quelle fréquence elle se
+      // résout d'elle-même. Un premier essai réussi ne logue rien.
+      if (attempt > 1) logSync({ ...logCtx, operation: operationOf(op), attempt, status: "success" });
+      return r;
     } catch (e) {
-      logCalendarError(op, e, attempt, attempts, transient);
       // Nommer l'opération à CHAQUE échec, pas seulement quand le budget de
       // rejeu est épuisé : une erreur définitive (400/403/404) sort dès la
       // première tentative et doit porter son nom elle aussi. gcalOp sert de
-      // garde pour ne pas préfixer deux fois le même objet d'erreur.
+      // garde pour ne pas préfixer deux fois le même objet d'erreur. Fait
+      // AVANT le journal, pour que `error` y soit déjà préfixé.
       if (!e.gcalOp) {
         e.gcalOp = op;
         e.message = `${op} : ${e?.errors?.[0]?.message || e.message || ""}`;
+      }
+      const tolerated = typeof benign === "function" && benign(e);
+      const willRetry = !tolerated && isTransient(e) && attempt < attempts;
+      logSync({
+        ...logCtx,
+        operation: operationOf(op),
+        attempt: attempts > 1 ? attempt : undefined,
+        status: tolerated ? "skipped" : willRetry ? "retry" : "error",
+        error: e.message,
+      });
+      // Le 403 mérite une phrase en clair : le JSON dit ce qui a échoué,
+      // pas quoi faire.
+      if (httpStatusOf(e) === 403) {
+        console.error(
+          `[sync] 403 sur ${op}. Scopes demandés : ${SCOPES.join(", ")}. Si le compte a été lié ` +
+            `avant l'ajout de calendar.events, repasse par « Connecter l'agenda Google ».`
+        );
       }
       throw e;
     }
@@ -332,15 +363,8 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
   // inclus. Sûr pour update / delete / calendars.insert, qui sont
   // naturellement idempotents. L'insert, lui, a son propre chemin
   // (insertResilient) car le rejouer à l'aveugle créerait un doublon.
-  async function callCalendar(op, fn) {
-    return withRetry((attempt) => rawCall(op, fn, attempt, MAX_ATTEMPTS, true), {
-      sleep,
-      onAttemptError: (e, attempt, transient) => {
-        if (transient && attempt < MAX_ATTEMPTS) {
-          console.warn(`Google Agenda: ${op} → échec transitoire, nouvelle tentative (${attempt + 1}/${MAX_ATTEMPTS}).`);
-        }
-      },
-    });
+  async function callCalendar(op, fn, ctx = {}) {
+    return withRetry((attempt) => rawCall(op, fn, ctx, attempt, MAX_ATTEMPTS), { sleep });
   }
 
   // SEULE lecture d'agenda du module, et elle est toujours filtrée par le
@@ -357,7 +381,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
         showDeleted: false,
         singleEvents: true,
         maxResults: 5,
-      })
+      }), { taskId: marker.value, calendarId }
     );
     const items = r?.data?.items || [];
     return (
@@ -509,7 +533,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
 
     // Plus d'échéance → plus d'événement.
     if (!task.due_date) {
-      if (task.calendar_event_id) await removeEvent(task.calendar_event_id, current);
+      if (task.calendar_event_id) await removeEvent(task.calendar_event_id, current, task.id);
       return { eventId: null, calendarId: null };
     }
 
@@ -518,7 +542,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     // La catégorie a changé d'agenda : on retire l'ancien événement par
     // son id stocké, puis on recrée sur la bonne destination.
     if (task.calendar_event_id && current && current !== target) {
-      await removeEvent(task.calendar_event_id, current);
+      await removeEvent(task.calendar_event_id, current, task.id);
       const moved = await insertEvent(requestBody, target);
       return { eventId: moved.data.id, calendarId: target };
     }
@@ -527,12 +551,20 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     if (task.calendar_event_id && current) {
       try {
         const r = await callCalendar("events.update", () =>
-          cal.events.update({ calendarId: current, eventId: task.calendar_event_id, requestBody })
+          cal.events.update({ calendarId: current, eventId: task.calendar_event_id, requestBody }),
+          { taskId: task.id, calendarId: current, eventId: task.calendar_event_id, benign: isGone }
         );
         return { eventId: r.data.id, calendarId: current };
       } catch (e) {
         if (!isGone(e)) throw e;
-        // Événement (ou agenda) effacé à la main : on repart sur une création.
+        // Événement (ou agenda) effacé à la main côté Google : on repart sur
+        // une création. Marqué « recreate » et non « insert » pour rester
+        // repérable au milieu des créations ordinaires — c'est le symétrique
+        // du cas « Travailler mon linkedin » trouvé à l'étape 3.
+        logSync({
+          taskId: task.id, calendarId: current, eventId: task.calendar_event_id,
+          operation: "recreate", status: "retry", error: e.message,
+        });
       }
     }
     const created = await insertEvent(requestBody, target);
@@ -584,26 +616,26 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
   // rend le « Premature close » inoffensif au lieu de créer un doublon.
   async function insertResilient(cal, calendarId, requestBody, op = "events.insert") {
     const marker = markerOf(requestBody);
+    const ctx = { taskId: marker?.value, calendarId, benign: isGone };
     // Une recherche qui échoue ne doit jamais masquer l'erreur d'insert.
     const lookup = async () => {
       try {
         return await findByMarker(cal, calendarId, marker);
       } catch (e) {
-        console.error(`Google Agenda: recherche par marqueur avant rejeu → ${e.message}`);
+        logSync({ ...ctx, operation: "lookup", status: "error", error: e.message });
         return null;
       }
     };
     const adopt = (found) => {
-      console.warn(
-        `Google Agenda: ${op} rejoué, mais l'événement existait déjà (${found.id}) → adopté, aucun doublon créé.`
-      );
+      // Un doublon évité : la trace la plus utile de tout ce chantier.
+      logSync({ ...ctx, operation: "adopt", status: "success", eventId: found.id });
       return { data: found, adopted: true };
     };
 
     try {
       return await withRetry(
         async (attempt) => ({
-          data: (await rawCall(op, () => cal.events.insert({ calendarId, requestBody }), attempt, MAX_ATTEMPTS, true)).data,
+          data: (await rawCall(op, () => cal.events.insert({ calendarId, requestBody }), ctx, attempt, MAX_ATTEMPTS)).data,
           adopted: false,
         }),
         {
@@ -636,6 +668,11 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
       // Le repli « l'agenda a disparu, on le recrée » n'a de sens que pour
       // les agendas de l'app : primary, lui, ne disparaît pas.
       if (!isGone(e) || calendarId === PRIMARY) throw e;
+      // Recréer un agenda entier n'est pas anodin : ça doit se voir.
+      logSync({
+        taskId: markerOf(requestBody)?.value, calendarId,
+        operation: "recreate_calendar", status: "retry", error: e.message,
+      });
       await forgetCalendar(which);
       const fresh = await ensureAppCalendar(which);
       if (!fresh) throw e;
@@ -644,7 +681,7 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     }
   }
 
-  async function removeEvent(eventId, calendarId) {
+  async function removeEvent(eventId, calendarId, taskId) {
     if (!eventId) return;
     const cal = await calendarApi();
     if (!cal) return;
@@ -655,9 +692,13 @@ export function createGoogle(store, { sleep = realSleep } = {}) {
     const id = calendarId || (await knownCalendarId());
     if (!id) return;
     try {
-      await callCalendar("events.delete", () => cal.events.delete({ calendarId: id, eventId }));
+      await callCalendar("events.delete", () => cal.events.delete({ calendarId: id, eventId }),
+        { taskId, calendarId: id, eventId, benign: isGone });
+      logSync({ taskId, calendarId: id, eventId, operation: "delete", status: "success" });
     } catch (e) {
-      if (!isGone(e)) throw e; // déjà parti : très bien
+      if (!isGone(e)) throw e;
+      // Déjà parti : rawCall l'a déjà journalisé en « skipped ». C'est le
+      // signe qu'un événement a été supprimé à la main côté Google.
     }
   }
 

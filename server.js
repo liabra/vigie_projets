@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import pg from "pg";
 import { randomUUID } from "crypto";
 import { createGoogle, MARKER_TASK } from "./google.js";
+import { logSync } from "./log.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -332,6 +333,7 @@ let reconcileRunning = false;
 
 export async function reconcileCalendarSync(opts = {}) {
   if (reconcileRunning) {
+    logSync({ operation: "reconcile", status: "busy" });
     return {
       busy: true,
       executed: false,
@@ -385,7 +387,7 @@ async function runReconcile({ execute = false, limit = RECONCILE_BATCH } = {}) {
       entry.result = task.sync_status;
       if (warning) entry.warning = warning;
     } catch (e) {
-      console.error(`Réconciliation ${task.id} → ${e.message}`);
+      logSync({ taskId: task.id, operation: "reconcile", status: "error", error: e.message });
       entry.action = entry.action || "error";
       entry.result = "error";
       entry.error = (e.message || "Échec inconnu").slice(0, 500);
@@ -504,7 +506,12 @@ export function shouldMirror(task) {
 //   outcome.error   → échec définitif
 //   sinon           → succès, eventId fait foi
 export function applySyncOutcome(task, outcome, attemptedAt) {
-  if (outcome.skipped) return task;
+  // Aucune tentative (Google non lié) : une tâche qui n'est jamais partie
+  // vers l'agenda doit se voir, sinon son absence passe pour un succès.
+  if (outcome.skipped) {
+    logSync({ taskId: task.id, operation: "sync", status: "skipped" });
+    return task;
+  }
   task.last_sync_attempt = attemptedAt;
 
   if (outcome.error) {
@@ -512,6 +519,14 @@ export function applySyncOutcome(task, outcome, attemptedAt) {
     // Hors périmètre : l'échec est consigné, mais l'état ne passe pas en
     // 'error' — une tâche sans échéance n'a pas de miroir à rater.
     task.sync_status = shouldMirror(task) ? "error" : "pending";
+    // Journalisé ICI, à l'instant précis où le statut est écrit : un statut
+    // posé par un autre chemin (réconciliation) resterait muet sinon.
+    // syncStatus dit ce qui a été persisté, status ce qui s'est passé — les
+    // deux diffèrent quand la tâche est hors périmètre.
+    logSync({
+      taskId: task.id, calendarId: task.calendar_id, operation: "sync",
+      status: "error", syncStatus: task.sync_status, error: task.sync_error,
+    });
     return task;
   }
 
@@ -524,6 +539,10 @@ export function applySyncOutcome(task, outcome, attemptedAt) {
   // il n'y a rien à refléter.
   task.sync_status = task.calendar_event_id ? "synced" : "pending";
   task.sync_error = null;
+  logSync({
+    taskId: task.id, calendarId: task.calendar_id, eventId: task.calendar_event_id,
+    operation: "sync", status: "success", syncStatus: task.sync_status,
+  });
   return task;
 }
 
@@ -548,13 +567,19 @@ async function syncTask(task) {
     await writeTask(task);
     return null;
   } catch (e) {
-    console.error(
-      `Synchro tâche ${task.id} (${task.category}, miroir=${shouldMirror(task)}) → échec définitif : ${e.message}`
-    );
+    // applySyncOutcome journalise l'échec au moment où il pose le statut :
+    // pas de seconde ligne ici, qui dirait la même chose autrement.
     applySyncOutcome(task, { error: e }, attemptedAt);
     // L'écriture d'état ne doit jamais faire échouer la requête : la tâche
     // elle-même est déjà enregistrée.
-    try { await writeTask(task); } catch (w) { console.error("Écriture de l'état de synchro:", w.message); }
+    try {
+      await writeTask(task);
+    } catch (w) {
+      // Cas le plus sournois : la tâche est en échec ET son statut n'a pas
+      // été persisté — rien en base ne le dira. Signalé, pas corrigé : le
+      // comportement reste celui d'avant.
+      logSync({ taskId: task.id, operation: "persist", status: "error", error: w.message });
+    }
 
     if (gcal.isScopeError(e)) {
       return "Tâche enregistrée. L'agenda Google demande de nouveaux droits : " +
@@ -793,7 +818,7 @@ app.post("/api/tasks", auth, async (req, res) => {
     const syncWarning = await syncTask(task);
     res.status(201).json({ task: taskToJson(task), syncWarning });
   } catch (e) {
-    console.error(e);
+    logSync({ taskId: task.id, operation: "persist", status: "error", error: e.message });
     res.status(500).json({ error: "Création impossible." });
   }
 });
@@ -827,7 +852,7 @@ app.patch("/api/tasks/:id", auth, async (req, res) => {
     const syncWarning = await syncTask(task);
     res.json({ task: taskToJson(task), syncWarning });
   } catch (e) {
-    console.error(e);
+    logSync({ taskId: req.params.id, operation: "persist", status: "error", error: e.message });
     res.status(500).json({ error: "Modification impossible." });
   }
 });
@@ -839,14 +864,17 @@ app.delete("/api/tasks/:id", auth, async (req, res) => {
     await deleteTask(task.id);
     let syncWarning = null;
     try {
-      await gcal.removeEvent(task.calendar_event_id, task.calendar_id);
+      await gcal.removeEvent(task.calendar_event_id, task.calendar_id, task.id);
     } catch (e) {
-      console.error("Google Agenda:", e.message);
+      logSync({
+        taskId: task.id, calendarId: task.calendar_id, eventId: task.calendar_event_id,
+        operation: "delete", status: "error", error: e.message,
+      });
       syncWarning = "Tâche supprimée, mais l'événement d'agenda est peut-être resté.";
     }
     res.json({ ok: true, syncWarning });
   } catch (e) {
-    console.error(e);
+    logSync({ taskId: req.params.id, operation: "persist", status: "error", error: e.message });
     res.status(500).json({ error: "Suppression impossible." });
   }
 });
@@ -896,7 +924,7 @@ app.post("/api/calendar/reconcile", auth, async (req, res) => {
     if (summary.busy) return res.status(409).json(summary);
     res.json(summary);
   } catch (e) {
-    console.error("Réconciliation:", e);
+    logSync({ operation: "reconcile", status: "error", error: e.message });
     res.status(500).json({ error: "Réconciliation impossible : " + (e.message || "erreur inconnue") });
   }
 });

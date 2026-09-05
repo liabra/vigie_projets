@@ -238,6 +238,29 @@ console.log("\n── Deux passes simultanées");
   eq("verrou relâché après une exception", [leve, apres.busy], [true, undefined]);
 }
 
+console.log("\n── Le verrou refusé est journalisé");
+{
+  reset([task({ id: "t-neuf" })]);
+  let ouvrir;
+  gate = new Promise((r) => { ouvrir = r; });
+  const premiere = reconcileCalendarSync({ execute: true });
+  await new Promise((r) => setImmediate(r));
+  // Capture uniquement pendant le refus.
+  const vraiLog = console.log, vraiErr = console.error;
+  const lignes = [];
+  const grab = (...a) => lignes.push(a.map(String).join(" "));
+  console.log = grab; console.error = grab;
+  const seconde = await reconcileCalendarSync({ execute: true });
+  console.log = vraiLog; console.error = vraiErr;
+  const busy = lignes.filter((l) => l.startsWith("[sync] {")).map((l) => JSON.parse(l.slice(7)))
+                     .find((l) => l.status === "busy");
+  eq("le refus produit une ligne « busy »", !!busy, true);
+  eq("elle nomme l'opération", busy && busy.operation, "reconcile");
+  eq("et porte un horodatage", !!(busy && busy.timestamp), true);
+  eq("le refus est bien signalé à l'appelant", seconde.busy, true);
+  ouvrir(); await premiere;
+}
+
 console.log("\n── L'endpoint traduit le verrou en 409");
 {
   reset([task({ id: "t-neuf" })]);
@@ -245,8 +268,15 @@ console.log("\n── L'endpoint traduit le verrou en 409");
   gate = new Promise((r) => { ouvrir = r; });
   const premiere = post({ execute: true });
   await new Promise((r) => setImmediate(r));
+  const vraiLog = console.log, vraiErr = console.error;
+  const journal = [];
+  const grab = (...a) => journal.push(a.map(String).join(" "));
+  console.log = grab; console.error = grab;
   const seconde = await post({ execute: true });
+  console.log = vraiLog; console.error = vraiErr;
   eq("409, pas 200 — la demande n'a PAS été traitée", seconde.status, 409);
+  eq("le log « busy » a été écrit AVANT que la réponse arrive",
+     journal.some((l) => l.startsWith("[sync] {") && JSON.parse(l.slice(7)).status === "busy"), true);
   eq("le client sait pourquoi", /déjà en cours/.test(seconde.json.note || ""), true);
   ouvrir();
   await premiere;
