@@ -217,6 +217,50 @@ restent, l'agenda cesse de bouger.
 
 ---
 
+## Notifications push (fondations)
+
+Vigie peut envoyer des notifications à ton téléphone ou ton navigateur, via
+Web Push (VAPID). Pour l'instant, seul un **push de test** existe ; la
+détection des tâches à notifier viendra ensuite.
+
+### Mise en place (une fois)
+
+1. Génère une paire de clés VAPID :
+   ```bash
+   node -e "console.log(require('web-push').generateVAPIDKeys())"
+   ```
+2. Dans les **Variables** Railway, ajoute :
+   - `VAPID_PUBLIC_KEY` — la clé publique ;
+   - `VAPID_PRIVATE_KEY` — la clé privée. **Nulle part ailleurs** : ni dans
+     le code, ni dans un fichier commité, ni dans un log ;
+   - `VAPID_SUBJECT` — `mailto:ton@adresse`, exigé par les services push.
+3. Redéploie. Un bouton **Activer les notifications** apparaît sous le
+   titre. Sur Android, ouvre Vigie dans Chrome (l'installer sur l'écran
+   d'accueil n'est pas nécessaire), clique, accepte.
+4. Pour vérifier la chaîne de bout en bout :
+   ```bash
+   curl -X POST https://<ton-domaine>/api/push/test -H "x-app-key: <APP_PASSWORD>"
+   ```
+   Tu dois recevoir « Ceci est un test ». La réponse dit combien
+   d'abonnements ont reçu, échoué, ou été purgés.
+
+Sans les trois variables, tout est dormant : pas de bouton, et les routes
+`/api/push/*` répondent 400.
+
+### Ce qu'il faut savoir
+
+- Un abonnement = un navigateur sur un appareil, identifié par son
+  `endpoint`. Réactiver sur le même appareil met à jour l'abonnement, sans
+  doublon.
+- Quand un navigateur résilie un abonnement (404/410 à l'envoi), Vigie
+  l'efface : il ne sera plus retenté.
+- Le service worker (`/sw.js`) ne fait que recevoir et afficher les
+  notifications ; il ne met rien en cache.
+- Pas de `user_id` sur les abonnements : l'app est mono-utilisateur. La
+  colonne pourra s'ajouter sans rien casser.
+
+---
+
 ## Tester en local
 
 Sans `DATABASE_URL`, l'app utilise le stockage en mémoire (remis à zéro à

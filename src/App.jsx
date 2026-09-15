@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import { theme, setKey, authHeaders } from "./shared.js";
 import Tasks from "./Tasks.jsx";
 import Articles from "./Articles.jsx";
+import Push from "./Push.jsx";
 import Stat, { statsRow } from "./Stat.jsx";
 
 // ─────────────────────────────────────────────────────────────
@@ -154,6 +155,12 @@ function serialise(projects) {
 export default function App() {
   const [projects, setProjects] = useState(null);
   const [locked, setLocked] = useState(false);
+  // Clé publique VAPID : sans elle, le bouton de notifications n'existe pas.
+  // /api/config est public (pas de x-app-key) et ne dit rien de sensible.
+  const [vapidKey, setVapidKey] = useState(null);
+  useEffect(() => {
+    fetch("/api/config").then((r) => r.json()).then((c) => setVapidKey(c.vapidPublicKey || null)).catch(() => {});
+  }, []);
   // Onglet courant, retenu d'une visite à l'autre. Le retour du
   // consentement Google (/?google=ok) ouvre d'office l'onglet Tâches :
   // c'est Tasks qui affiche la confirmation.
@@ -368,6 +375,7 @@ export default function App() {
             <span style={S.subtitle}>le tableau de bord de tous tes projets</span>
           </div>
           {syncMsg && <div style={S.syncMsg}>{syncMsg}</div>}
+          {!locked && <div style={{ marginTop: 8 }}><Push vapidPublicKey={vapidKey} onLocked={() => setLocked(true)} /></div>}
         </header>
 
         <div style={S.tabs} role="tablist">

@@ -5,6 +5,7 @@ import pg from "pg";
 import { randomUUID } from "crypto";
 import { createGoogle, MARKER_TASK } from "./google.js";
 import { logSync } from "./log.js";
+import webpush from "web-push";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -141,6 +142,17 @@ export async function ensureTable() {
     updated_at timestamptz NOT NULL DEFAULT now()
   )`);
   await pool.query("CREATE TABLE IF NOT EXISTS app_settings (key text PRIMARY KEY, value text)");
+  // Abonnements Web Push. Un par navigateur/appareil, identifié par son
+  // endpoint (unique). Pas de user_id : l'app est mono-utilisateur. Le jour
+  // où il en faut un, c'est un ADD COLUMN user_id + un index — les clés
+  // p256dh/auth et l'unicité sur endpoint restent valables telles quelles.
+  await pool.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id uuid PRIMARY KEY,
+    endpoint text NOT NULL UNIQUE,
+    p256dh text NOT NULL,
+    auth text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
 }
 async function loadState() {
   if (pool) {
@@ -328,6 +340,7 @@ export const __testHooks =
         tasks: () => memTasks,
         setAuth: (a) => { memAuth = a; },
         setSetting: (k, v) => { memSettings.set(k, v); },
+        subscriptions: () => memSubs,
       };
 
 // ── Repère de jour de début (best-effort) ─────────────────────
@@ -490,6 +503,78 @@ async function runReconcile({ execute = false, limit = RECONCILE_BATCH } = {}) {
     stillFailing: details.filter((d) => d.action !== "skip" && d.result !== "synced").length,
     details,
   };
+}
+
+// ── Notifications push ────────────────────────────────────────
+// Les clés VAPID viennent de l'environnement, jamais du code ni des logs.
+// Sans elles, tout ce bloc est dormant : le front ne voit pas de clé
+// publique et n'affiche pas le bouton.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "";
+const pushConfigured = () => !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && VAPID_SUBJECT);
+if (pushConfigured()) webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+
+let memSubs = [];
+
+// Un objet PushSubscription du navigateur a cette forme exacte ; on ne
+// garde que ce qu'il faut pour envoyer.
+function parseSubscription(b) {
+  const endpoint = typeof b?.endpoint === "string" ? b.endpoint.trim() : "";
+  const p256dh = b?.keys?.p256dh, auth = b?.keys?.auth;
+  if (!/^https:\/\//.test(endpoint) || typeof p256dh !== "string" || typeof auth !== "string") return null;
+  return { endpoint: endpoint.slice(0, 2000), p256dh, auth };
+}
+async function upsertSubscription(sub) {
+  if (!pool) {
+    const i = memSubs.findIndex((x) => x.endpoint === sub.endpoint);
+    const row = { id: i >= 0 ? memSubs[i].id : randomUUID(), ...sub, created_at: i >= 0 ? memSubs[i].created_at : new Date() };
+    if (i >= 0) memSubs[i] = row; else memSubs.push(row);
+    return row;
+  }
+  const r = await pool.query(
+    `INSERT INTO push_subscriptions (id, endpoint, p256dh, auth) VALUES ($1,$2,$3,$4)
+     ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+     RETURNING *`,
+    [randomUUID(), sub.endpoint, sub.p256dh, sub.auth]
+  );
+  return r.rows[0];
+}
+async function listSubscriptions() {
+  if (!pool) return [...memSubs];
+  return (await pool.query("SELECT * FROM push_subscriptions ORDER BY created_at")).rows;
+}
+async function deleteSubscription(endpoint) {
+  if (!pool) { memSubs = memSubs.filter((x) => x.endpoint !== endpoint); return; }
+  await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
+}
+
+// Envoie un même payload à tous les abonnements. Un 404/410 signifie que
+// le navigateur a résilié l'abonnement : on l'efface, sinon on réessaierait
+// à chaque envoi pour rien. Ne lève jamais — renvoie le bilan.
+export async function sendPushToAll(payload) {
+  const subs = await listSubscriptions();
+  const body = JSON.stringify(payload);
+  let sent = 0, removed = 0, failed = 0;
+  for (const s of subs) {
+    try {
+      await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, body, { TTL: 3600 });
+      sent++;
+    } catch (e) {
+      const code = e?.statusCode;
+      if (code === 404 || code === 410) {
+        await deleteSubscription(s.endpoint).catch(() => {});
+        removed++;
+      } else {
+        failed++;
+        // L'endpoint est une URL longue et opaque : on n'en journalise que
+        // l'hôte, suffisant pour distinguer FCM d'un autre service.
+        let host = "?"; try { host = new URL(s.endpoint).host; } catch {}
+        console.error(`[push] échec vers ${host} → ${code || "erreur"} ${e?.message || ""}`);
+      }
+    }
+  }
+  return { total: subs.length, sent, removed, failed };
 }
 
 // ── Articles ──────────────────────────────────────────────────
@@ -997,6 +1082,26 @@ app.delete("/api/tasks/:id", auth, async (req, res) => {
   }
 });
 
+// ── Push : abonnement et test ─────────────────────────────────
+app.post("/api/push/subscribe", auth, async (req, res) => {
+  if (!pushConfigured()) return res.status(400).json({ error: "Les notifications ne sont pas configurées sur le serveur (clés VAPID)." });
+  const sub = parseSubscription(req.body);
+  if (!sub) return res.status(400).json({ error: "Abonnement invalide : endpoint https et clés p256dh/auth attendus." });
+  try {
+    const row = await upsertSubscription(sub);
+    res.status(201).json({ ok: true, id: row.id, createdAt: row.created_at });
+  } catch (e) {
+    console.error("[push] enregistrement de l'abonnement :", e.message);
+    res.status(500).json({ error: "Enregistrement impossible." });
+  }
+});
+
+// Debug : un push à tout le monde, pour valider la chaîne de bout en bout.
+app.post("/api/push/test", auth, async (_req, res) => {
+  if (!pushConfigured()) return res.status(400).json({ error: "Clés VAPID absentes." });
+  res.json(await sendPushToAll({ title: "Vigie", body: "Ceci est un test", url: "/" }));
+});
+
 // ── Google : état, lien de connexion, déconnexion ─────────────
 app.get("/api/google/status", auth, async (_req, res) => {
   try {
@@ -1106,7 +1211,11 @@ app.get("/oauth/callback", async (req, res) => {
 
 // Indique au front si un code d'accès est requis
 app.get("/api/config", (_req, res) =>
-  res.json({ needsKey: !!APP_PASSWORD, models: ALLOWED_MODELS, defaultModel: DEFAULT_MODEL, google: gcal.configured() })
+  res.json({
+    needsKey: !!APP_PASSWORD, models: ALLOWED_MODELS, defaultModel: DEFAULT_MODEL, google: gcal.configured(),
+    // Publique par nature : c'est elle que le navigateur donne à PushManager.
+    vapidPublicKey: pushConfigured() ? VAPID_PUBLIC_KEY : null,
+  })
 );
 
 // ── Front (build Vite) ────────────────────────────────────────
