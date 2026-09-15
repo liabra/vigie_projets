@@ -542,6 +542,18 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
           </select>
         </div>
         <div style={{ marginTop: 12 }}>
+          <label style={S.label}>Début (facultatif — pour une tâche qui s’étale)</label>
+          <input
+            className="at-focus"
+            style={{ ...S.field, borderColor: souci ? theme.red : theme.line }}
+            type="date"
+            value={start}
+            max={dueDay || undefined}
+            onChange={(e) => setStart(e.target.value)}
+          />
+          {souci && <div style={S.startError}>{souci}</div>}
+        </div>
+        <div style={{ marginTop: 12 }}>
           <label style={S.label}>Échéance (vide = pas d’événement d’agenda)</label>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <input
@@ -556,18 +568,6 @@ function TaskEditor({ task, onCancel, onSave, onDelete }) {
               journée entière
             </label>
           </div>
-        </div>
-        <div style={{ marginTop: 12 }}>
-          <label style={S.label}>Début (facultatif — pour une tâche qui s’étale)</label>
-          <input
-            className="at-focus"
-            style={{ ...S.field, borderColor: souci ? theme.red : theme.line }}
-            type="date"
-            value={start}
-            max={dueDay || undefined}
-            onChange={(e) => setStart(e.target.value)}
-          />
-          {souci && <div style={S.startError}>{souci}</div>}
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: 20, gap: 10 }}>
           <button className="at-btn at-focus" style={{ ...S.ghost, color: "#B23B15", borderColor: "#F0C6B7" }} onClick={onDelete}>Supprimer</button>
