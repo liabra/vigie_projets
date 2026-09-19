@@ -6,6 +6,7 @@ import { randomUUID } from "crypto";
 import { createGoogle, MARKER_TASK } from "./google.js";
 import { logSync } from "./log.js";
 import webpush from "web-push";
+import { classifyTasks, DUE_SOON_DAYS } from "./notifications.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -1096,6 +1097,23 @@ app.post("/api/push/subscribe", auth, async (req, res) => {
   }
 });
 
+// Aperçu des tâches à notifier. Lecture seule, aucun envoi : c'est la
+// matière première des étapes suivantes (messages, puis envoi planifié).
+// `today` en paramètre sert à inspecter un autre jour que celui en cours.
+app.get("/api/notifications/preview", auth, async (req, res) => {
+  const jour = String(req.query.today || "");
+  if (jour && !/^\d{4}-\d{2}-\d{2}$/.test(jour)) {
+    return res.status(400).json({ error: "Paramètre today invalide : attendu AAAA-MM-JJ." });
+  }
+  try {
+    const r = classifyTasks(await listTasks(), jour || undefined);
+    res.json({ ...r, counts: { overdue: r.overdue.length, dueToday: r.dueToday.length, dueSoon: r.dueSoon.length } });
+  } catch (e) {
+    console.error("[notifications] aperçu :", e.message);
+    res.status(500).json({ error: "Aperçu impossible." });
+  }
+});
+
 // Debug : un push à tout le monde, pour valider la chaîne de bout en bout.
 app.post("/api/push/test", auth, async (_req, res) => {
   if (!pushConfigured()) return res.status(400).json({ error: "Clés VAPID absentes." });
@@ -1215,6 +1233,7 @@ app.get("/api/config", (_req, res) =>
     needsKey: !!APP_PASSWORD, models: ALLOWED_MODELS, defaultModel: DEFAULT_MODEL, google: gcal.configured(),
     // Publique par nature : c'est elle que le navigateur donne à PushManager.
     vapidPublicKey: pushConfigured() ? VAPID_PUBLIC_KEY : null,
+    dueSoonDays: DUE_SOON_DAYS,
   })
 );
 
