@@ -1,6 +1,7 @@
 // Détection des tâches à notifier. Fonction pure : aucun serveur, aucune
 // horloge truquée — le jour de référence est un paramètre.
 import { classifyTasks, addDays, DUE_SOON_DAYS } from "../notifications.js";
+import { today } from "../day.js";
 
 let ko = 0;
 const eq = (l, got, want) => {
@@ -143,7 +144,11 @@ H.setTasks([
 eq("sans clé → 401", (await get("?today=" + AUJ, {})).status, 401);
 eq("mauvaise clé → 401", (await get("?today=" + AUJ, { "x-app-key": "non" })).status, 401);
 eq("today mal formé → 400", (await get("?today=demain")).status, 400);
-eq("sans today → le jour courant", (await get()).json.today, new Date().toISOString().slice(0, 10));
+// Surtout pas new Date().toISOString().slice(0,10) ici : ce serait le jour
+// UTC, c'est-à-dire exactement le bug qu'on vient de corriger. Entre minuit
+// et 2 h à Paris, cette assertion échouerait — ou pire, validerait le faux.
+eq("sans today → le jour courant à Paris", (await get()).json.today, today());
+eq("le fuseau de référence est annoncé", (await get()).json.timeZone, "Europe/Paris");
 {
   // Lecture seule : rien ne doit bouger en base.
   const avant = JSON.stringify(H.tasks());

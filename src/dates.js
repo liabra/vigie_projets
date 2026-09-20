@@ -4,9 +4,12 @@
 //  (glissement de fuseau, plage début → échéance, validation du début)
 //  méritent d'être vérifiées plutôt que relues.
 // ─────────────────────────────────────────────────────────────
+import { dayIn, today } from "../day.js";
 
-// Une journée entière est stockée à minuit UTC : on la lit donc en
-// UTC, sinon le fuseau la ferait glisser d'un jour.
+// Le jour tel qu'il est STOCKÉ, lu à même la chaîne ISO. Sert à remplir le
+// champ date du formulaire, qui doit rendre exactement ce qui a été
+// enregistré. Pour juger d'un retard ou comparer à aujourd'hui, c'est dayIn
+// (day.js) qu'il faut — voir isLate.
 export const dayOf = (iso) => (iso || "").slice(0, 10);
 export const localInput = (iso) => {
   const d = new Date(iso);
@@ -27,15 +30,13 @@ export function humanRange(task) {
   const fin = humanDate(task);
   if (!task.startDate || !task.dueDate) return fin;
   const debut = new Date(task.startDate + "T00:00:00.000Z");
-  const memeMois = task.startDate.slice(0, 7) === dayOf(task.dueDate).slice(0, 7);
+  const memeMois = task.startDate.slice(0, 7) === dayIn(task.dueDate).slice(0, 7);
   const opts = memeMois
     ? { weekday: "short", day: "numeric", timeZone: "UTC" }
     : { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" };
   return debut.toLocaleDateString("fr-FR", opts) + " → " + fin;
 }
 
-// Aujourd'hui en UTC, pour comparer aux échéances « journée entière ».
-const todayUtc = () => new Date().toISOString().slice(0, 10);
 // Les deux mêmes règles que le serveur, dites une fois : un début n'a de
 // sens qu'avec une échéance, et il ne peut pas la dépasser. Renvoie le
 // message à afficher, ou null. Le serveur revalide de toute façon — ceci
@@ -47,4 +48,9 @@ export function startProblem(start, dueDay) {
   return null;
 }
 
-export const isLate = (task) => task.status !== "fait" && task.dueDate && dayOf(task.dueDate) < todayUtc();
+// « En retard » se juge sur le MÊME jour que les notifications : day.js est
+// la source commune aux deux. Sans ça, entre minuit et 2 h à Paris, une
+// carte pouvait afficher « ⚠ en retard » sans que la tâche soit dans overdue
+// côté serveur. dayIn des deux côtés de la comparaison : l'échéance ET
+// aujourd'hui doivent se lire dans le même fuseau.
+export const isLate = (task, now) => task.status !== "fait" && !!task.dueDate && dayIn(task.dueDate) < today(now);
